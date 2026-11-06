@@ -3,11 +3,13 @@
 /*
  * mom — keep concurrent AI coding agents from stepping on each other.
  *
- * Zero dependencies. State lives in <repo>/.mom/ as plain files:
- *   agents/<id>.json   one record per live agent (plan, pid, heartbeat, inbox cursor)
- *   claims/<path>.json one record per claimed file; created with O_EXCL so
- *                      "check and claim" is a single atomic filesystem operation
- *   log.jsonl          append-only event log (plans, notes, handoffs)
+ * Zero dependencies. State is plain files, kept per checkout:
+ *   ~/.mom/repos/<hash of repo root>/   by default (nothing is written into your repo), or
+ *   <repo>/.mom/                        if you ran `mom init` there (shared with other tools, git-ignored)
+ *     agents/<id>.json   one record per live agent (plan, pid, heartbeat, inbox cursor, files edited)
+ *     claims/<path>.json one record per claimed file; created with O_EXCL so
+ *                        "check and claim" is a single atomic filesystem operation
+ *     log.jsonl          append-only event log (plans, notes, handoffs)
  *
  * Agents never need to read these files; they use `mom <cmd>` and the
  * Claude Code hooks (`mom hook <event>`) do the rest automatically.
@@ -16,8 +18,10 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const cp = require('child_process');
+const crypto = require('crypto');
 
-const VERSION = '0.3.0';
+const VERSION = '0.4.0';
+const MOM_HOME = process.env.MOM_HOME || path.join(os.homedir(), '.mom');
 const TTL_SEC = parseInt(process.env.MOM_TTL_SEC || '', 10) || 900; // reservation TTL
 const TTL_MS = TTL_SEC * 1000;
 const HOST = os.hostname();
@@ -49,39 +53,63 @@ function out(s) { if (s) process.stdout.write(s.endsWith('\n') ? s : s + '\n'); 
 function die(msg, code = 1) { process.stderr.write(`mom: ${msg}\n`); process.exit(code); }
 
 // ---------------------------------------------------------------- root / state dir
-function findRoot(start) {
-  if (process.env.MOM_ROOT) return path.resolve(process.env.MOM_ROOT);
-  let dir = path.resolve(start || process.cwd());
-  // 1) nearest ancestor with .mom/
-  for (let d = dir; ; d = path.dirname(d)) {
-    if (fs.existsSync(path.join(d, '.mom'))) return d;
-    if (path.dirname(d) === d) break;
+function ancestorWith(start, name) {
+  for (let d = path.resolve(start); ; d = path.dirname(d)) {
+    if (fs.existsSync(path.join(d, name))) return d;
+    if (path.dirname(d) === d) return null;
   }
-  // 2) nearest ancestor with .git
-  for (let d = dir; ; d = path.dirname(d)) {
-    if (fs.existsSync(path.join(d, '.git'))) return d;
-    if (path.dirname(d) === d) break;
+}
+function globalDir(root) {
+  let real = root; try { real = fs.realpathSync(root); } catch {}
+  return path.join(MOM_HOME, 'repos', crypto.createHash('sha1').update(real).digest('hex').slice(0, 16));
+}
+/**
+ * Where is the checkout, and where does its state live?
+ *   MOM_ROOT                      → that directory (state in its .mom/ if present, else ~/.mom/repos/<hash>)
+ *   nearest ancestor with .mom/   → in-repo state (opted in with `mom init`; shareable with non-Claude tools)
+ *   nearest ancestor with .git    → ~/.mom/repos/<hash>: zero footprint in the repo, works with no setup
+ *   neither                       → not a repo; hooks stay silent
+ */
+function locate(start) {
+  const cwd = path.resolve(start || process.cwd());
+  if (process.env.MOM_ROOT) {
+    const root = path.resolve(process.env.MOM_ROOT);
+    const local = path.join(root, '.mom');
+    return { root, dir: fs.existsSync(local) ? local : globalDir(root) };
   }
-  return dir;
+  // nearest marker wins; the global state home (~/.mom) is never an in-repo marker
+  for (let d = cwd; ; d = path.dirname(d)) {
+    const local = path.join(d, '.mom');
+    if (local !== MOM_HOME && fs.existsSync(path.join(local, 'agents')) && !fs.existsSync(path.join(local, 'repos'))) return { root: d, dir: local };
+    if (fs.existsSync(path.join(d, '.git'))) return { root: d, dir: globalDir(d) };
+    if (path.dirname(d) === d) return { root: cwd, dir: null };
+  }
 }
 class State {
-  constructor(root) {
-    this.root = root;
-    this.dir = path.join(root, '.mom');
-    this.agentsDir = path.join(this.dir, 'agents');
-    this.claimsDir = path.join(this.dir, 'claims');
-    this.logFile = path.join(this.dir, 'log.jsonl');
+  constructor(loc) {
+    if (typeof loc === 'string') loc = { root: loc, dir: path.join(loc, '.mom') };
+    this.root = loc.root;
+    this.dir = loc.dir;
+    this.agentsDir = this.dir && path.join(this.dir, 'agents');
+    this.claimsDir = this.dir && path.join(this.dir, 'claims');
+    this.logFile = this.dir && path.join(this.dir, 'log.jsonl');
     this._cfg = null;
   }
-  get cfg() { if (!this._cfg) this._cfg = readJSON(path.join(this.dir, 'config.json'), {}); return this._cfg; }
+  get cfg() {
+    if (!this._cfg) this._cfg = { ...readJSON(path.join(MOM_HOME, 'config.json'), {}), ...(this.dir ? readJSON(path.join(this.dir, 'config.json'), {}) : {}) };
+    return this._cfg;
+  }
+  saveCfg(patch) { this.ensure(); this._cfg = null; writeJSONAtomic(path.join(this.dir, 'config.json'), { ...readJSON(path.join(this.dir, 'config.json'), {}), ...patch }); }
   /** How agents should invoke mom in this repo (same prefix the hooks use). */
   get cmd() { return this.cfg.cmd || 'mom'; }
   /** 'advisory' (default): surgical Edits to a file someone else holds are allowed with a warning; only destructive
    *  operations are blocked (whole-file Write / shell rewrite of a held file, tree-wide git ops).
    *  'strict': any edit to a file another agent holds is blocked. */
   get mode() { return process.env.MOM_MODE || this.cfg.mode || 'advisory'; }
-  get enabled() { return fs.existsSync(this.dir); }
+  /** Enabled in any git checkout (or anywhere with a .mom/) unless MOM_DISABLE is set. */
+  get enabled() { return !!this.dir && !process.env.MOM_DISABLE; }
   ensure() {
+    if (!this.dir) die('not inside a git repository (or a directory with .mom/). Run `mom init` here, or set MOM_ROOT.');
     fs.mkdirSync(this.agentsDir, { recursive: true });
     fs.mkdirSync(this.claimsDir, { recursive: true });
     if (!fs.existsSync(this.logFile)) fs.writeFileSync(this.logFile, '');
@@ -337,7 +365,7 @@ const BRIEF = (others, cmd, mode) => [
   `Protocol (cheap, do it): 1) Before your first edit run \`${cmd} plan "<one-line goal>" <files you expect to touch>\`.`,
   `2) If you change a shared interface (signature, schema, CLI flag, export), run \`${cmd} note "<what changed>"\`.`,
   `3) If blocked: work on your other files first, or \`${cmd} wait <file>\` (blocks until free), then re-read the file before editing. When you are done with a file others may need, \`${cmd} release <file>\` early.`,
-  `4) Never run git stash/reset/checkout/restore on the whole tree or \`git add -A\`: other agents have uncommitted work here. \`${cmd} status\` shows who holds what.`,
+  `4) Commit only your own files: \`git add $(${cmd} mine) && git commit\`. Never \`git add -A\`/\`commit -a\`, stash, reset, or checkout/restore the whole tree: other agents have uncommitted work here. \`${cmd} status\` shows who holds what.`,
 ].join('\n');
 
 // ---------------------------------------------------------------- commands
@@ -357,16 +385,35 @@ function parseArgs(argv) {
 }
 
 function needSelf(st, flags) {
+  st.ensure();
   const me = resolveSelf(st, null, flags);
   if (!me) die('cannot tell which agent you are. Set MOM_AGENT=<id> or pass --as <id>.');
   ensureAgent(st, me);
   return me;
 }
+/** Files this agent has edited in this session (never released; used to scope commits). */
+function myEdits(st, me) { const a = st.getAgent(me); return Object.keys((a && a.edited) || {}).sort(); }
+function noteEdit(st, me, rel) { const a = st.getAgent(me); if (!a) return; a.edited = a.edited || {}; a.edited[rel] = NOW(); st.saveAgent(a); }
+function gitStaged(root) {
+  try { return cp.execFileSync('git', ['diff', '--cached', '--name-only'], { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).split('\n').filter(Boolean); } catch { return []; }
+}
+/** Other live agents with edits to `rel` in their *current* turn (a claim with edits, or an advisory overlap edit). */
+function activeEditors(st, rel, me, present) {
+  const c = st.getClaim(rel);
+  const out = [];
+  for (const a of Object.values(present)) {
+    if (a.id === me) continue;
+    const holds = c && c.agent === a.id && c.modified && st.claimValid(c, present);
+    const inTurn = a.edited && a.edited[rel] && a.edited[rel] > (a.turn_ended || 0);
+    if (holds || inTurn) out.push(a);
+  }
+  return out;
+}
 
 const commands = {
   init(st, { flags }) {
     const root = flags.root ? path.resolve(flags.root) : gitRootOrCwd();
-    st = new State(root);
+    st = new State(root); // in-repo state: opt this checkout in explicitly, shareable with non-Claude tools
     st.ensure();
     const done = [`created ${path.relative(process.cwd(), st.dir) || '.mom'}/`];
     // .gitignore
@@ -388,7 +435,7 @@ const commands = {
     out('mom: ' + done.join('; ') + `; mode: ${flags.mode === 'strict' ? 'strict' : 'advisory'}` + '\nStart two agents in this repo and run `mom status` to watch them coordinate.');
   },
   status(st, { flags }) {
-    if (!st.enabled) die('not initialized here. Run `mom init` in the repo root.');
+    st.ensure();
     const me = resolveSelf(st, null, flags);
     if (flags.json) {
       const present = st.gc();
@@ -397,7 +444,6 @@ const commands = {
     out(renderStatus(st, me));
   },
   plan(st, { flags, pos }) {
-    if (!st.enabled) die('not initialized here. Run `mom init` in the repo root.');
     const me = needSelf(st, flags);
     const text = pos[0];
     if (!text) die('usage: mom plan "<one-line goal>" [files...]');
@@ -417,7 +463,6 @@ const commands = {
     out(lines.join('\n'));
   },
   claim(st, { flags, pos }) {
-    if (!st.enabled) die('not initialized here. Run `mom init` in the repo root.');
     const me = needSelf(st, flags);
     const files = pos.map(f => st.rel(f)).filter(Boolean);
     if (!files.length) die('usage: mom claim <files...> [--wait] [--timeout SEC] [--steal]');
@@ -445,6 +490,19 @@ const commands = {
           continue;
         }
       }
+      if (r.ok && flags.wait) {
+        // Holding the claim is not enough if someone is mid-way through an advisory edit on it: wait for their turn to end.
+        let editors = activeEditors(st, f, me, st.gc());
+        if (editors.length) process.stderr.write(`mom: ${f} has in-progress edits by ${editors.map(a => label(a, me)).join(', ')}; waiting for their turn to end…\n`);
+        ensureAgent(st, me, { waiting_for: f });
+        while (editors.length && NOW() < deadline) {
+          // mutual wait (they are waiting on something too): nobody is editing, so go ahead
+          if (editors.some(a => a.waiting_for)) break;
+          sleepMs(1500); editors = activeEditors(st, f, me, st.gc());
+        }
+        ensureAgent(st, me, { waiting_for: null });
+        if (editors.length) lines.push(`${f}: ${editors.map(a => label(a, me)).join(', ')} ${editors.some(a => a.waiting_for) ? 'is waiting too, so nobody is editing it now — go ahead, but' : 'still has edits in progress (timed out); if you continue,'} re-read it and run the tests before committing.`);
+      }
       if (r.ok) {
         const handed = st.readLog(0).events.some(e => e.type === 'handoff' && e.agent !== me && (e.modified || []).includes(f));
         lines.push(`claimed ${f}${handed ? ' — another agent edited this file earlier; re-read it before editing' : ''}`);
@@ -457,7 +515,6 @@ const commands = {
   },
   wait(st, args) { args.flags.wait = true; return commands.claim(st, args); },
   release(st, { flags, pos }) {
-    if (!st.enabled) die('not initialized here.');
     const me = needSelf(st, flags);
     const files = flags.all ? st.claims().filter(c => c.agent === me).map(c => c.path) : pos.map(f => st.rel(f)).filter(Boolean);
     if (!files.length) die('usage: mom release <files...> | --all');
@@ -467,7 +524,6 @@ const commands = {
     out(released.length ? `released ${released.join(' ')}` : 'nothing to release');
   },
   note(st, { flags, pos }) {
-    if (!st.enabled) die('not initialized here.');
     const me = needSelf(st, flags);
     if (!pos[0]) die('usage: mom note "<what changed and what others must do>"');
     st.log({ agent: me, type: 'note', text: pos[0] });
@@ -475,7 +531,7 @@ const commands = {
     out(`note posted to ${others} other agent${others === 1 ? '' : 's'}.`);
   },
   who(st, { flags, pos }) {
-    if (!st.enabled) die('not initialized here.');
+    st.ensure();
     const me = resolveSelf(st, null, flags);
     for (const p of pos) {
       const rel = st.rel(p); const c = rel && st.getClaim(rel);
@@ -484,22 +540,28 @@ const commands = {
     }
   },
   inbox(st, { flags }) {
-    if (!st.enabled) die('not initialized here.');
     const me = needSelf(st, flags);
     out(renderInbox(st, me) || 'no updates from other agents.');
   },
+  mine(st, { flags }) {
+    // Files you have edited this session: the right argument to `git add`.
+    const me = needSelf(st, flags);
+    const files = myEdits(st, me);
+    out(files.length ? files.join('\n') : '');
+    if (!files.length) process.stderr.write('mom: you have not edited any files yet this session.\n');
+  },
   log(st, { flags }) {
-    if (!st.enabled) die('not initialized here.');
+    st.ensure();
     const n = parseInt(flags.n, 10) || 30;
     const { events } = st.readLog(0);
     for (const e of events.slice(-n)) out(`${new Date(e.ts).toISOString()} [${short(e.agent)}] ${e.type}${e.text ? ` ${JSON.stringify(e.text)}` : ''}${e.files ? ' ' + e.files.join(' ') : ''}${e.released ? ' ' + e.released.join(' ') : ''}${e.path ? ' ' + e.path : ''}`);
   },
-  gc(st) { if (!st.enabled) die('not initialized here.'); const p = st.gc(); out(`ok: ${Object.keys(p).length} live agent(s), ${st.claims().length} claim(s)`); },
+  gc(st) { st.ensure(); const p = st.gc(); out(`ok: ${Object.keys(p).length} live agent(s), ${st.claims().length} claim(s)`); },
   leave(st, { flags }) {
-    if (!st.enabled) die('not initialized here.');
     const me = needSelf(st, flags);
     leave(st, me); out(`[${short(me)}] left.`);
   },
+  where(st) { out(st.dir || '(not in a repo)'); },
   hook(st, { pos }) { return runHook(st, pos[0]); },
   version() { out(VERSION); },
   help() { out(HELP); },
@@ -535,6 +597,7 @@ const HOOK_EVENTS = [
   ['PreToolUse', 'Bash', 'pre-bash', 10],
   ['PostToolUse', 'Edit|Write|MultiEdit|NotebookEdit|Bash|Task|Agent', 'post-tool', 10],
   ['Stop', '', 'stop', 10],
+  ['SubagentStop', '', 'session-end', 10],
   ['SessionEnd', '', 'session-end', 10],
 ];
 function installHooks(settingsPath, cmd) {
@@ -572,22 +635,35 @@ const GIT_TREEWIDE = [
   [/\bgit\s+checkout\s+(?!--|-b\b|\S+\s+--\s+)\S+\s*$/, 'switching branches would move other agents\' working tree under them'],
   [/\bgit\s+switch\b/, 'switching branches would move other agents\' working tree under them'],
   [/\bgit\s+reset\s+--(hard|merge)\b/, 'hard reset would discard other agents\' edits'],
+  [/\bgit\s+reset\b(?!.*\s--\s|.*\s(src|test|lib|\w+\/|\w+\.\w+)\b)/, 'a reset without a pathspec unstages or moves the branch under other agents; use `git restore --staged <your files>`'],
+  [/\bgit\s+(update-ref|symbolic-ref)\b/, 'moving refs under a shared working tree strands other agents\' work'],
   [/\bgit\s+clean\b/, 'git clean would delete other agents\' new files'],
   [/\bgit\s+(rebase|merge|pull)\b/, 'rewriting the working tree while other agents edit it causes conflicts'],
   [/\bgit\s+add\s+(-A|--all|\.|\*)(\s|$)/, 'stage only your own files: `git add <files>`; other agents\' half-done work is in this tree'],
   [/\bgit\s+commit\s+(-[a-zA-Z]*a|--all)\b/, 'commit only your own files: `git add <files> && git commit`; other agents\' half-done work is in this tree'],
 ];
+function onPath(name) {
+  try { return !!cp.execFileSync(process.platform === 'win32' ? 'where' : 'which', [name], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim(); } catch { return false; }
+}
 function runHook(st, event) {
   const input = readStdinJSON();
-  if (input.cwd) st = new State(findRoot(input.cwd));
-  if (!st.enabled) return; // mom not enabled in this repo: silent no-op (safe to install globally)
+  if (input.cwd) st = new State(locate(input.cwd));
+  if (!st.enabled) return; // not a repo (or MOM_DISABLE): silent no-op, safe to install globally
   const me = resolveSelf(st, input, {});
   if (!me) return;
+  st.ensure();
   switch (event) {
     case 'session-start': {
-      st.ensure();
       ensureAgent(st, me, { pid: hostPidFromAncestors(), cwd: input.cwd || st.root });
-      if (process.env.CLAUDE_ENV_FILE) { try { fs.appendFileSync(process.env.CLAUDE_ENV_FILE, `export MOM_AGENT=${JSON.stringify(me)}\n`); } catch {} }
+      // Make `mom` callable from the agent's shell even when installed only as a plugin: put our bin/ on PATH.
+      let cmd = 'mom';
+      if (process.env.CLAUDE_ENV_FILE) {
+        try {
+          fs.appendFileSync(process.env.CLAUDE_ENV_FILE, `export MOM_AGENT=${JSON.stringify(me)}\n`);
+          if (!onPath('mom') && process.platform !== 'win32') fs.appendFileSync(process.env.CLAUDE_ENV_FILE, `export PATH=${JSON.stringify(path.dirname(fs.realpathSync(__filename)))}:"$PATH"\n`);
+        } catch {}
+      } else if (!onPath('mom')) cmd = `node ${fs.realpathSync(__filename)}`;
+      if (!st.cfg.cmd || st.cfg.cmd !== cmd) st.saveCfg({ cmd });
       const others = st.liveAgents().filter(a => a.id !== me);
       if (!others.length) return; // zero token cost when working alone
       out(BRIEF(others.length, st.cmd, st.mode) + '\n\n' + renderStatus(st, me));
@@ -612,7 +688,7 @@ function runHook(st, event) {
       const rel = st.rel(p);
       if (!rel || rel.startsWith('.mom/')) return;
       const r = st.tryClaim(rel, me, { modified: true });
-      if (r.ok) return;
+      if (r.ok) { noteEdit(st, me, rel); return; }
       const owner = r.owner;
       const c = r.claim || {};
       const wholeFile = input.tool_name === 'Write' && fs.existsSync(path.join(st.root, rel));
@@ -622,6 +698,7 @@ function runHook(st, event) {
         a.overlaps = a.overlaps || {};
         const first = !a.overlaps[rel];
         a.overlaps[rel] = NOW(); st.saveAgent(a);
+        noteEdit(st, me, rel);
         st.log({ agent: me, type: 'overlap', path: rel, holder: c.agent });
         if (first) hookOut('PreToolUse', `mom: heads-up — ${rel} is also being edited right now by ${owner ? label(owner, me) : '[' + short(c.agent) + ']'}. Keep this edit small and local, don't reformat or rewrite the file, and re-Read it before further edits (its contents may change under you).`);
         return;
@@ -636,15 +713,60 @@ function runHook(st, event) {
     }
     case 'pre-bash': {
       ensureAgent(st, me); st.renewAll(me);
-      const cmd = String((input.tool_input || {}).command || '');
-      if (!cmd || /\bmom\b/.test(cmd)) return;
+      const raw = String((input.tool_input || {}).command || '');
+      // `$(mom mine)` inside a git command stands for this agent's own files; a command that *is* a mom call is ours.
+      const cmd = raw.replace(/\$\(\s*(?:node\s+\S*mom(?:\.js)?|mom)\s+mine\s*\)/g, 'MOM_MINE');
+      if (!cmd.trim() || (/^\s*(?:cd\s+\S+\s*(?:;|&&)\s*)?(?:node\s+\S*mom(?:\.js)?|mom)\s/.test(cmd) && !/[;&|]\s*(?:git|sed|mv|cp|rm|tee|python3?|node|perl)\b/.test(cmd))) return;
       const others = st.liveAgents().filter(a => a.id !== me);
       if (!others.length) return;
       for (const [re, why] of GIT_TREEWIDE) {
         if (re.test(cmd)) {
-          process.stderr.write(`mom: BLOCKED — ${others.length} other agent${others.length === 1 ? ' is' : 's are'} working in this tree; ${why}.\n`);
+          const mine = myEdits(st, me);
+          const fix = /\bgit\s+(add|commit)\b/.test(cmd) && mine.length ? ` Your files this session: ${mine.join(' ')}. Do: \`git add ${mine.join(' ')} && git commit -m "..."\` (or \`git add $(${st.cmd} mine)\`).` : '';
+          process.stderr.write(`mom: BLOCKED — ${others.length} other agent${others.length === 1 ? ' is' : 's are'} working in this tree; ${why}.${fix}\n`);
           process.exit(2);
         }
+      }
+      if (/\bgit\s+commit\b/.test(cmd)) {
+        // Commit gate. Files in the index that another live agent is editing *right now* (holds with uncommitted edits)
+        // would put their half-finished work into your commit: block, and say exactly how to proceed.
+        // Files others edited earlier this session but released: one heads-up, then allow.
+        const present = st.gc();
+        // what the index will hold when `git commit` runs: what is staged now, plus anything a `git add` earlier in this command adds
+        const cwd = input.cwd || st.root;
+        const willAdd = [...cmd.matchAll(/\bgit\s+add\s+([^;&|\n]+)/g)].flatMap(m => m[1].trim().split(/\s+/))
+          .filter(a => a && !a.startsWith('-') && a !== '--').flatMap(a => a === 'MOM_MINE' ? myEdits(st, me) : [st.rel(path.resolve(cwd, a.replace(/^["']|["']$/g, '')))]).filter(Boolean);
+        const staged = [...new Set([...gitStaged(st.root), ...willAdd])];
+        const busy = staged.map(f => ({ f, who: activeEditors(st, f, me, present) })).filter(x => x.who.length);
+        const a = st.getAgent(me) || {};
+        if (busy.length) {
+          // Someone is mid-edit on a file you are committing: their half-finished hunks will ride along. In a shared tree
+          // that is often unavoidable (v0.4 tried blocking here; agents waited out their timeouts and gave up, for no
+          // fewer broken commits), so advisory mode warns once and lets the commit through. Strict mode blocks.
+          const files = busy.map(h => h.f);
+          const who = [...new Set(busy.flatMap(h => h.who.map(x => label(x, me))))].join(', ');
+          const advice = `Make sure the tests are green right now, or \`git restore --staged ${files.join(' ')}\` and commit the rest; \`${st.cmd} wait ${files.join(' ')}\` returns when they are done.`;
+          if (st.mode === 'strict') {
+            st.log({ agent: me, type: 'blocked', path: files.join(' '), holder: busy[0].who[0].id, kind: 'commit' });
+            process.stderr.write(`mom: BLOCKED — ${files.join(' ')} ${files.length === 1 ? 'has' : 'have'} edits in progress by ${who}; committing now would bake their half-finished changes into your commit. ${advice}\n`);
+            process.exit(2);
+          }
+          const key = files.join(' ');
+          if (a.commit_warned !== key) {
+            a.commit_warned = key; st.saveAgent(a);
+            hookOut('PreToolUse', `mom: heads-up — ${key} ${files.length === 1 ? 'has' : 'have'} edits in progress by ${who}; this commit will include their half-finished changes. ${advice}`);
+          }
+          return;
+        }
+        const theirs = {};
+        for (const a of others) for (const f of Object.keys(a.edited || {})) (theirs[f] = theirs[f] || []).push(a);
+        const shared = staged.filter(f => theirs[f]);
+        if (shared.length && !a.commit_warned) {
+          a.commit_warned = 'released'; st.saveAgent(a);
+          const who = [...new Set(shared.flatMap(f => theirs[f]))].map(x => label(x, me)).join(', ');
+          hookOut('PreToolUse', `mom: heads-up — ${shared.join(' ')} ${shared.length === 1 ? 'was' : 'were'} also edited this session by ${who} (not right now). Your commit will include their changes to ${shared.length === 1 ? 'it' : 'them'}; that is fine if the tests are green. \`${st.cmd} mine\` lists the files you edited.`);
+        }
+        return;
       }
       if (WRITEY.test(cmd) || INLINE_WRITE.test(cmd)) {
         const present = st.gc();
@@ -667,6 +789,7 @@ function runHook(st, event) {
     case 'stop': {
       // Turn finished: release everything so idle agents never block others. Claims are re-acquired automatically on the next edit.
       const a = st.getAgent(me); if (!a) return;
+      a.turn_ended = NOW(); st.saveAgent(a); // edits before this point are no longer "in progress"
       const mine = st.claims().filter(c => c.agent === me);
       if (!mine.length) return;
       const modified = mine.filter(c => c.modified).map(c => c.path);
@@ -685,11 +808,15 @@ function runHook(st, event) {
 
 const HELP = `mom ${VERSION} — keep concurrent AI coding agents from stepping on each other.
 
-Setup (once per repo):      mom init            # .mom/, Claude Code hooks, skill
+Install: as a Claude Code plugin (/plugin marketplace add josephrich98/mom; /plugin install mom@mom) — works in every
+git checkout with no further setup; state lives in ~/.mom/. Or per repo: \`mom init\` (.mom/ in the repo, hooks in
+.claude/settings.json, skill), which other tools (Codex, Cursor, humans) can share.
+
 Agent protocol:
   mom plan "<goal>" [files...]   announce what you're doing; reserve files
   mom status                     who is here, who holds what, recent notes
   mom note "<interface change>"  broadcast something others must know
+  mom mine                       files you edited this session  (git add $(mom mine))
   mom claim <files...>           reserve files (hooks do this for Edit/Write automatically)
   mom wait <file> [--timeout S]  block until a file is free, then claim it
   mom release <files...>|--all   hand files back (hooks do this at end of turn)
@@ -698,9 +825,11 @@ Agent protocol:
   mom log [--n N]                raw event log
   mom gc                         drop dead agents / expired claims
   mom leave                      deregister yourself
-Hooks:                       mom hook <session-start|prompt|pre-edit|pre-bash|post-tool|stop|session-end>
+  mom where                      where this checkout's state lives
+Hooks:  mom hook <session-start|prompt|pre-edit|pre-bash|post-tool|stop|session-end>
 Modes:  mom init --mode advisory (default) | strict      (or MOM_MODE=...)
-Env: MOM_AGENT (identity), MOM_ROOT (repo root), MOM_TTL_SEC (reservation TTL, default 900)
+Env:    MOM_AGENT (identity), MOM_ROOT (repo root), MOM_HOME (state root, default ~/.mom),
+        MOM_TTL_SEC (reservation TTL, default 900), MOM_DISABLE=1 (hooks do nothing)
 `;
 
 // ---------------------------------------------------------------- main
@@ -710,7 +839,7 @@ Env: MOM_AGENT (identity), MOM_ROOT (repo root), MOM_TTL_SEC (reservation TTL, d
   if (flags.version || cmd === '--version') return out(VERSION);
   const fn = commands[cmd];
   if (!fn) die(`unknown command "${cmd}"\n${HELP}`);
-  const st = new State(findRoot(flags.root));
+  const st = new State(locate(flags.root));
   try { fn(st, { flags, pos }); }
   catch (e) { die(e && e.stack || String(e)); }
 })();

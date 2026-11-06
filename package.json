@@ -1,9 +1,9 @@
 {
   "name": "mom-cli",
-  "version": "0.3.0",
-  "description": "Keep concurrent AI coding agents from stepping on each other: atomic file claims, plans, and Claude Code hooks. Zero dependencies.",
+  "version": "0.4.0",
+  "description": "Run several AI coding agents in one checkout without them overwriting each other: atomic file claims, change notes, commit hygiene. Claude Code plugin + CLI, zero dependencies.",
   "bin": { "mom": "bin/mom.js" },
-  "files": ["bin", "skills", "README.md", "LICENSE"],
+  "files": ["bin", "hooks", "skills", ".claude-plugin", "README.md", "LICENSE"],
   "scripts": {
     "test": "node --test test/*.test.js",
     "bench": "node bench/run.js",

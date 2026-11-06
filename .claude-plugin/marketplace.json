@@ -1,0 +1,14 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "mom",
+  "description": "mom keeps parallel AI coding agents from stepping on each other in one repo.",
+  "owner": { "name": "Joseph Rich", "url": "https://github.com/josephrich98" },
+  "plugins": [
+    {
+      "name": "mom",
+      "description": "Two agents, one repo, nobody's work gets clobbered. File claims, change notes, and commit hygiene for parallel Claude Code sessions.",
+      "source": "./",
+      "category": "productivity"
+    }
+  ]
+}

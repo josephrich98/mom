@@ -19,7 +19,8 @@ No heavy prompting. No supervising LLM. An agent working alone must pay nothing.
 | The up-front file list is wrong | Every Edit/Write passes through a PreToolUse hook that claims the file on the spot (or blocks). The plan is advisory; the hook is the truth. |
 | Two files depend on a changing interface | `mom note "<what changed>"` broadcasts; others receive it as `additionalContext` after their next tool call. |
 | An agent read a file that another agent then changed | Releasing an edited file logs a *handoff*. Everyone else is told "re-read X before editing" exactly once. `mom wait` says the same thing when it acquires a file that was handed off. |
-| Shell commands bypass the Edit tool | PreToolUse on Bash blocks `sed -i`/`>`/`mv`… aimed at a file someone else holds, and blocks tree-wide git operations (`stash`, `checkout .`, `reset --hard`, `add -A`, `commit -a`) while others are present. Reads are never blocked. |
+| Shell commands bypass the Edit tool | PreToolUse on Bash blocks `sed -i`/`>`/`mv`… aimed at a file someone else holds, and blocks tree-wide git operations (`stash`, `checkout .`, `reset`, `add -A`, `commit -a`, `update-ref`) while others are present. Reads are never blocked. |
+| A commit sweeps up someone else's half-finished edits | Every file an agent edits is remembered for the session (`mom mine`). `git add -A` / `commit -a` are blocked with the exact `git add <your files>` to run instead. A plain `git commit` whose index holds a file another agent is mid-edit on (claimed with edits, or edited during their current turn) gets a one-time heads-up naming the file and the agent; strict mode blocks it. We tried blocking in advisory mode too: agents did the right thing (`mom wait`, twice), timed out because in a shared tree "their turn" can be their whole run, and gave up without committing, for no fewer broken commits than baseline. So: warn, don't block. |
 | Idle agents hog files | The Stop hook releases everything at the end of a turn. Claims come back automatically on the next edit. |
 
 ## Advisory vs strict (what the benchmark taught us)
@@ -49,10 +50,16 @@ Overlap detection is a string comparison. The participating agents already have 
 ## State layout
 
 ```
-.mom/
-  agents/<id>.json     plan, pid, host, heartbeat, inbox cursor
+~/.mom/repos/<sha1 of checkout path>/    default: nothing is written into your repo
+  (or <repo>/.mom/ after `mom init`:    shared with non-Claude tools, git-ignored)
+  agents/<id>.json     plan, pid, host, heartbeat, inbox cursor, files edited this session
   claims/<path>.json   owner, since, expires, modified, edits
   log.jsonl            join / plan / note / blocked / handoff / leave
+  config.json          cmd (how agents invoke mom here), mode
 ```
 
-Everything is plain JSON so you can `cat` it when something looks off. `.mom/` is git-ignored by `mom init`.
+Everything is plain JSON so you can `cat` it when something looks off (`mom where` prints the directory). Each git worktree is its own checkout and gets its own state, which is what you want: worktrees don't collide.
+
+## Why state lives outside the repo by default
+
+The v0.3 `mom init` wrote `.mom/` and `.claude/settings.json` into the repo. The settings file ends up committed, which forces mom on every teammate who clones the repo; and a tool that modifies the repo it is supposed to protect is a hard sell. As a Claude Code plugin, mom's hooks are installed once per user, state is keyed by the checkout's path under `~/.mom/`, and the repo is untouched. `mom init` remains for opting a checkout in explicitly (Codex and Cursor can share the in-repo `.mom/`).

@@ -1,6 +1,6 @@
 # Using mom outside Claude Code
 
-Claude Code gets enforcement for free through hooks. Other agents can participate cooperatively through the CLI; the claims they take are honoured by the Claude Code hooks, and vice versa.
+Claude Code gets enforcement for free through hooks. Other agents can participate cooperatively through the CLI (`npm i -g mom-cli`); the claims they take are honoured by the Claude Code hooks, and vice versa. All tools on one machine share state automatically: it is keyed by the checkout's path under `~/.mom/` (or lives in `<repo>/.mom/` after `mom init`).
 
 ## Codex CLI / Cursor / Aider / anything with a shell
 
@@ -11,11 +11,11 @@ This repo uses mom to coordinate concurrent agents.
 - Before your first edit: `mom plan "<goal>" <files>`
 - Before editing any file not in your plan: `mom claim <file>` (exit 3 = held by someone else; do other work or `mom wait <file>`)
 - After changing a shared interface: `mom note "<what changed>"`
+- Commit only your own files: `git add $(mom mine) && git commit`. Never add -A / commit -a / stash / reset / checkout . while `mom status` shows other agents.
 - When finished: `mom release --all`
-- Never: git stash / checkout . / reset --hard / add -A while `mom status` shows other agents.
 ```
 
-Set `MOM_AGENT=<unique id>` in that agent's environment so the CLI knows who it is. If unset, mom tries `CLAUDE_CODE_SESSION_ID`, then matches the parent process against registered agents.
+Set `MOM_AGENT=<unique id>` in that agent's environment so the CLI knows who it is. If unset, mom tries `CLAUDE_CODE_SESSION_ID`, then matches the parent process against registered agents. (`mom mine` only knows about files claimed through `mom claim`/`mom plan` for tools without hooks.)
 
 ## Codex hooks
 

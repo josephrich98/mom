@@ -1,0 +1,3 @@
+#!/bin/sh
+# Shim so `mom` is a real command on PATH when installed as a Claude Code plugin (no npm needed).
+exec node "$(dirname "$0")/mom.js" "$@"
