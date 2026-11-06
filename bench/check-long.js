@@ -45,21 +45,21 @@ checks.rename_stored_title = items.length === 1 && items[0].title === 'first ite
 const old = path.join(tmp, 'old.json'); fs.writeFileSync(old, JSON.stringify([{ id: 1, text: 'legacy', done: false, createdAt: 'x' }]));
 r = cli(['list'], old); checks.rename_migrates_old = r.code === 0 && r.out.includes('legacy');
 // due
-r = cli(['add', 'pay rent', '--due', '2026-11-01']); checks.due_add = r.code === 0;
+r = cli(['add', 'pay rent', '--due', '2099-11-01']); checks.due_add = r.code === 0;
 r = cli(['add', 'old thing', '--due', '2020-01-01']); checks.due_add_past = r.code === 0;
 r = cli(['add', 'bad2', '--due', 'notadate']); checks.due_reject = r.code !== 0;
 // priority
 r = cli(['add', 'urgent', '--priority', 'high']); checks.prio_add = r.code === 0;
 r = cli(['add', 'meh', '--priority', 'low']); checks.prio_add_low = r.code === 0;
 r = cli(['add', 'bad', '--priority', 'bogus']); checks.prio_reject = r.code !== 0;
-r = cli(['add', 'both', '--priority', 'high', '--due', '2026-12-01']); checks.both_add = r.code === 0;
+r = cli(['add', 'both', '--priority', 'high', '--due', '2099-12-01']); checks.both_add = r.code === 0;
 // list
 r = cli(['list']);
 const lines = r.out.split('\n'); const idx = s => lines.findIndex(l => l.includes(s)); const lineOf = s => lines[idx(s)] || '';
 checks.list_ok = r.code === 0;
 checks.prio_shown = /high/i.test(lineOf('urgent'));
-checks.due_shown = /2026-11-01/.test(lineOf('pay rent'));
-checks.both_shown = /high/i.test(lineOf('both')) && /2026-12-01/.test(lineOf('both'));
+checks.due_shown = /2099-11-01/.test(lineOf('pay rent'));
+checks.both_shown = /high/i.test(lineOf('both')) && /2099-12-01/.test(lineOf('both'));
 checks.prio_sorted = idx('urgent') >= 0 && idx('first item') > idx('urgent') && idx('meh') > idx('first item');
 r = cli(['list', '--priority', 'high']); checks.prio_filter = r.code === 0 && r.out.includes('urgent') && !r.out.includes('meh');
 r = cli(['list', '--overdue']); checks.overdue_filter = r.code === 0 && r.out.includes('old thing') && !r.out.includes('pay rent');
