@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="860" height="470" viewBox="0 0 860 470" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13.5">
+  <defs>
+    <style>
+      .bg { fill: #0f1117; }
+      .bar { fill: #1b1e27; }
+      .t { fill: #c9d1d9; }
+      .dim { fill: #6e7681; }
+      .p { fill: #8b949e; }
+      .hi { fill: #e3b341; }
+      .ok { fill: #3fb950; }
+      .bad { fill: #f85149; }
+      .cmd { fill: #79c0ff; }
+      .title { fill: #8b949e; font-size: 12px; }
+    </style>
+  </defs>
+  <rect class="bg" width="860" height="470" rx="10"/>
+
+  <!-- terminal 1 -->
+  <rect class="bar" x="0" y="0" width="860" height="26" rx="10"/>
+  <circle cx="16" cy="13" r="5" fill="#ff5f57"/><circle cx="34" cy="13" r="5" fill="#febc2e"/><circle cx="52" cy="13" r="5" fill="#28c840"/>
+  <text class="title" x="430" y="17" text-anchor="middle">terminal 1 — claude</text>
+  <text class="t" x="16" y="52"><tspan class="p">› </tspan>add priorities to todos</text>
+  <text class="dim" x="16" y="74">● Edit src/store.js · Edit src/cli.js · Edit README.md …</text>
+
+  <!-- terminal 2 -->
+  <rect class="bar" x="0" y="96" width="860" height="26"/>
+  <circle cx="16" cy="109" r="5" fill="#ff5f57"/><circle cx="34" cy="109" r="5" fill="#febc2e"/><circle cx="52" cy="109" r="5" fill="#28c840"/>
+  <text class="title" x="430" y="113" text-anchor="middle">terminal 2 — claude (same checkout)</text>
+  <text class="t" x="16" y="148"><tspan class="p">› </tspan>add due dates to todos</text>
+
+  <text class="hi" x="16" y="176">mom is active: 1 other agent is working in this repo right now.</text>
+  <text class="t" x="16" y="196">  [03f0] "add priorities to todos" — 3 files: <tspan class="hi">src/store.js*</tspan> src/cli.js README.md</text>
+  <text class="dim" x="16" y="216">  (* = has uncommitted edits by that agent; wait for release before touching)</text>
+  <text class="dim" x="16" y="236">  Protocol: mom plan "&lt;goal&gt;" &lt;files&gt; · mom note "&lt;interface change&gt;" · commit only your own files: git add $(mom mine)</text>
+
+  <text class="dim" x="16" y="266">● Bash <tspan class="cmd">mom plan "add due dates" src/store.js src/format.js README.md</tspan></text>
+  <text class="t" x="16" y="286">  claimed: src/format.js</text>
+  <text class="t" x="16" y="306">  NOT claimed: src/store.js is held by [03f0] "add priorities to todos" — do that file last, or `mom wait src/store.js`</text>
+
+  <text class="dim" x="16" y="336">● Write src/store.js</text>
+  <text class="bad" x="16" y="356">  mom: BLOCKED — src/store.js is currently held by agent [03f0] "add priorities to todos" (claimed 2m ago, 3 edits so far).</text>
+  <text class="t" x="16" y="376">  Rewriting the whole file would discard their edits; use the Edit tool for a surgical change instead.</text>
+
+  <text class="dim" x="16" y="406">● Bash <tspan class="cmd">git add -A &amp;&amp; git commit -m "due dates"</tspan></text>
+  <text class="bad" x="16" y="426">  mom: BLOCKED — 1 other agent is working in this tree; stage only your own files.</text>
+  <text class="ok" x="16" y="446">  Your files this session: README.md src/format.js. Do: `git add README.md src/format.js &amp;&amp; git commit -m "..."`</text>
+</svg>
