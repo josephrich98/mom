@@ -560,3 +560,40 @@ test('stale-write guard: an agent that read a file only through a glob still can
   assert.equal(bash('A', "sed -i 's/1/2/' a.js").code, 0, 'an in-place edit is still fine');
   assert.equal(bash('A', "cat > a.js <<'E'\nnew\nE").code, 0, 'the sed touched (and so saw) a.js');
 });
+
+test('a script that splices in stale text has the other agent\'s change restored (lost-update repair)', () => {
+  const d = mk(), f = path.join(d, 'm.md');
+  fs.writeFileSync(f, '# T\n\nWe used 412 plots in 206 pairs. Results were clear. Long closing sentence here.\n\n## Methods\n\n412 plots.\n');
+  const hook = (sid, ev, extra) => run(d, ['hook', ev], { stdin: hookIn(sid, { cwd: d, ...extra }), env: { MOM_MODE: 'advisory' } });
+  hook('A', 'pre-read', { tool_name: 'Read', tool_input: { file_path: f } });   // A reads the whole file
+  hook('B', 'pre-read', { tool_name: 'Read', tool_input: { file_path: f } });
+  const sedB = "sed -i 's/412/438/g; s/206/219/g' m.md";
+  hook('B', 'pre-bash', { tool_name: 'Bash', tool_input: { command: sedB } });
+  cp.execSync(sedB, { cwd: d });
+  assert.equal(hook('B', 'post-tool', { tool_name: 'Bash' }).out, '');           // an in-place edit with nothing lost: silent
+  // A shortens line 3 with text from its stale read, inside a read-modify-write script
+  const py = `python3 - <<'E'\np='m.md'\nL=open(p).read().split('\\n')\nL[2]='We used 412 plots in 206 pairs. Results were clear.'\nopen(p,'w').write('\\n'.join(L))\nE`;
+  assert.equal(hook('A', 'pre-bash', { tool_name: 'Bash', tool_input: { command: py } }).code, 0);
+  cp.execSync(py, { cwd: d });
+  const r = hook('A', 'post-tool', { tool_name: 'Bash' });
+  assert.match(r.out, /undid 2 changes.*412.{0,4} → .{0,4}438/);
+  assert.equal(fs.readFileSync(f, 'utf8'), '# T\n\nWe used 438 plots in 219 pairs. Results were clear.\n\n## Methods\n\n438 plots.\n');
+  // A has now seen the restored text, so a deliberate change back is its own business
+  cp.execSync("sed -i 's/438 plots in/400 plots in/' m.md", { cwd: d });
+  hook('A', 'pre-bash', { tool_name: 'Bash', tool_input: { command: "sed -i 's/219/200/' m.md" } });
+  cp.execSync("sed -i 's/219/200/' m.md", { cwd: d });
+  assert.doesNotMatch(hook('A', 'post-tool', { tool_name: 'Bash' }).out, /undid/);
+});
+
+test('a write that changes nothing in a file others changed gets one "expected, re-read" note', () => {
+  const d = mk(), f = path.join(d, 'm.md');
+  fs.writeFileSync(f, 'alpha beta\n');
+  const hook = (sid, ev, extra) => run(d, ['hook', ev], { stdin: hookIn(sid, { cwd: d, ...extra }), env: { MOM_MODE: 'advisory' } });
+  hook('A', 'pre-read', { tool_name: 'Read', tool_input: { file_path: f } });
+  fs.writeFileSync(f, 'alpha gamma\n'); // someone else
+  const cmd = "python3 -c \"s=open('m.md').read(); assert 'beta' in s; open('m.md','w').write(s)\"";
+  hook('A', 'pre-bash', { tool_name: 'Bash', tool_input: { command: cmd } });
+  assert.match(hook('A', 'post-tool', { tool_name: 'Bash' }).out, /at the same time as you.*re-read it/);
+  hook('A', 'pre-bash', { tool_name: 'Bash', tool_input: { command: cmd } });
+  assert.equal(hook('A', 'post-tool', { tool_name: 'Bash' }).out, '');
+});

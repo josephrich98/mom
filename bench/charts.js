@@ -8,7 +8,9 @@ const fs = require('fs'), path = require('path');
 const OUT = path.join(__dirname, '..', 'assets', 'charts');
 fs.mkdirSync(OUT, { recursive: true });
 
-function rows(tag, cond, { latestPerK = false } = {}) {
+function rows(tag, cond, opts = {}) {
+  if (Array.isArray(tag)) return tag.flatMap(t => rows(t, cond, opts)); // pool several batches
+  const { latestPerK = false } = opts;
   const f = path.join(__dirname, `results-${tag}.jsonl`);
   if (!fs.existsSync(f)) return [];
   const all = fs.readFileSync(f, 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l))
@@ -30,12 +32,12 @@ const SECTIONS = [
   { title: 'Code: 17-file shop CLI, 8 agents, 1 task each', groups: [
     { label: '1 agent at a time', base: ['hl-code-c1', 'baseline'], mom: ['hl-code-c1', 'mom-advisory'], k: true, build: true },
     { label: '3 at a time', base: ['hl-code-c3', 'baseline'], mom: ['hl-code-c3', 'mom-advisory'], k: true, build: true },
-    { label: 'All 8 at once', base: ['hl-code-c8', 'baseline'], mom: ['hl3-code-c8', 'mom-advisory'], k: true },
+    { label: 'All 8 at once', base: [['hl-code-c8', 'v8-code-c8'], 'baseline'], mom: ['v8-code-c8', 'mom-advisory'], k: true },
   ] },
   { title: 'Writing: one manuscript, 6 agents, 1 edit each', groups: [
     { label: '1 agent at a time', base: ['hl-paper-c1', 'baseline'], mom: ['hl-paper-c1', 'mom-advisory'], k: true, build: true },
     { label: '3 at a time', base: ['hl-paper-c3', 'baseline'], mom: ['hl-paper-c3', 'mom-advisory'], k: true, build: true },
-    { label: 'All 6 at once', base: ['hl3-paper-c6', 'baseline'], mom: ['hl3-paper-c6', 'mom-advisory'], k: true },
+    { label: 'All 6 at once', base: [['v8-paper-c6', 'v9-paper-c6'], 'baseline'], mom: [['v8-paper-c6', 'v9-paper-c6'], 'mom-advisory'], k: true },
   ] },
 ];
 

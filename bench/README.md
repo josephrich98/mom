@@ -32,6 +32,26 @@ Conditions: `baseline` (no mom) · `mom-advisory` (the default install) · `mom-
 
 The long/commit/slow/haiku prompts are in `tasks-long.json` / `tasks-commit.json`; `tasks-six.json` splits the same work six ways. All agents are told that other agents are working in the checkout.
 
+## Results v0.6 (2026-11-10): lost-update repair
+
+**Why.** On v0.5.1 the "all at once" writing cell showed no benefit (97.1% vs 96.6%). The transcripts of every bad run, in both conditions, showed the same thing. An agent read `manuscript.md`, then ran a script such as `L=open(p).read().split('\n'); L[4]=<abstract rewritten from what it read earlier>; open(p,'w').write(...)`. The rewrite silently reverted another agent's `sed` (412 → 438, g C m-2 yr-1 → Mg C ha-1 yr-1, "intermittent" → "pulsed"). The script reads the file before writing it, so v0.5.1 treated it as an in-place edit and let it through.
+
+**What changed** (`bin/merge3.js`, about 70 lines, plus about 45 in `bin/mom.js`). mom keeps the text of each file as each agent last viewed it in full: a `Read` without offset or limit, or a plain `cat f`. Before an agent's write it keeps the current text, and after the write it runs a word-level three-way merge (base = the agent's view, theirs = the text before the write, mine = the text after). Changes that someone else made since the agent's view, and that the write put back to the base text, are merged back into the file, and the writer is told what was restored. Where both sides changed the same words, the writer's version stands. In-place edits never trigger it, because their output already contains the other changes. A write that changes nothing in a file others changed since the agent read it (usually a script whose `assert` on the old text failed) gets one note that concurrent edits are expected and the agent should re-read and re-apply. That targets agents that otherwise stop with "someone else changed it while I was working".
+
+Agents are not told others are present, and all start at once (`--stagger 0`). Baseline and mom ran counterbalanced in the same batches. `v8` is the first build; `v9` also records a view from `cat f` inside a longer command (`cat -A f | head; cat f`). The one v8 mom run that lost three tasks had viewed the file that way.
+
+| | baseline | mom v0.6 |
+|---|---|---|
+| Writing, 6 at once (`v8-paper-c6` + `v9-paper-c6`, n = 20 + 20): checks passed | 81.0% | **97.9%** |
+| fully correct runs | 7/20 | 16/20 |
+| runs that lost a whole task | 11/20 | 1/20 (v8 only) |
+| wall-clock, tokens (output + uncached input), cost | 45 s, 112k, $0.62 | 38 s, 112k, $0.60 |
+| Code, 8 at once (`v8-code-c8`, n = 5 + 5): checks passed | 72.4% (75.8% pooled with `hl-code-c8`, n = 10) | **99.1%** |
+| fully correct runs | 1/5 | 3/5 |
+| turns, cost | 75, $1.71 | 103, $2.02 (v0.5.1 `hl3`: 100, $2.07) |
+
+v9 alone: 87.1% vs 99.7%, 4/10 vs 9/10 fully correct. On the shop the merge never fired (0 restores), and the overhead there is unchanged from v0.5.1: mom agents run about 70% more test runs, finishing work that uncoordinated runs lose. Every writing restore came from `abstract-limits` rewriting the abstract and undid 25–27 word-level changes from four other agents. The checker confirmed that its own trim (≤ 220 words) and its Limitations section survived. The remaining imperfect mom runs each left one "intermittent drought" in text that another agent added after `term` had finished: a semantic conflict, like the shop's leftover `priceCents` in new tier code, which no merge can catch.
+
 ## Results v0.5.1 (2026-11-10, n = 10 per cell)
 
 Same fixtures, harness and definitions as v0.5 below, run on a Claude subscription login (`--login`) because the API key had no credit. Every row is 10 valid trials. Baselines (`v3-long`, `v4-haiku`, `v4-slow`) and the mom rows were measured hours apart on the same day, and baselines drift by day (fast-suite baseline: 30.7 turns on 11-06, 36.0 on 11-10).

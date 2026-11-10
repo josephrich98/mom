@@ -10,6 +10,7 @@
  *     claims/<path>.json one record per claimed file; created with O_EXCL so
  *                        "check and claim" is a single atomic filesystem operation
  *     log.jsonl          append-only event log (notes, handoffs)
+ *     snap/<agent>/      the text of each file as that agent last read it, and just before its current write
  *
  * Agents never need to read these files; they use `mom <cmd>` and the
  * Claude Code hooks (`mom hook <event>`) do the rest automatically.
@@ -19,8 +20,9 @@ const path = require('path');
 const os = require('os');
 const cp = require('child_process');
 const crypto = require('crypto');
+const { merge3 } = require('./merge3');
 
-const VERSION = '0.5.1';
+const VERSION = '0.6.0';
 const MOM_HOME = process.env.MOM_HOME || path.join(os.homedir(), '.mom');
 const TTL_SEC = parseInt(process.env.MOM_TTL_SEC || '', 10) || 900; // reservation TTL
 const TTL_MS = TTL_SEC * 1000;
@@ -460,6 +462,47 @@ function lastWriteSinceRead(st, me, files) {
   const e = st.readLog(0).events.find(e => e.type === 'write' && e.agent !== me && files.includes(e.path) && e.ts > since(e.path));
   return e ? { ...e, unread: !seen[e.path] } : null;
 }
+// Lost-update repair. mom keeps each file as the agent last read it in full ("view") and as it was just before the
+// agent's write ("pre"). If the write put back text that someone else changed in between, the change is restored.
+function snapFile(st, me, kind, rel) { return path.join(st.dir, 'snap', encodeURIComponent(me), `${kind}-${encPath(rel)}`); }
+function getSnap(st, me, kind, rel) { try { return fs.readFileSync(snapFile(st, me, kind, rel), 'utf8'); } catch { return null; } }
+function putSnap(st, me, kind, rel, text) {
+  const f = snapFile(st, me, kind, rel);
+  if (text == null) { try { fs.unlinkSync(f); } catch {} return; }
+  fs.mkdirSync(path.dirname(f), { recursive: true }); fs.writeFileSync(f, text);
+}
+function readText(st, rel) {
+  try { const p = path.join(st.root, rel); return fs.statSync(p).size <= 1 << 20 ? fs.readFileSync(p, 'utf8') : null; } catch { return null; }
+}
+function noteView(st, me, files) { for (const f of files) { const t = readText(st, f); if (t != null) putSnap(st, me, 'view', f, t); } }
+function beforeWrite(st, me, files) { for (const f of files) if (getSnap(st, me, 'view', f) != null) { const t = readText(st, f); if (t != null) putSnap(st, me, 'pre', f, t); } }
+/** After a tool call: repair what this agent's writes undid. Returns messages for the agent. */
+function afterWrite(st, me) {
+  const dir = path.join(st.dir, 'snap', encodeURIComponent(me)), msgs = [];
+  let names = []; try { names = fs.readdirSync(dir).filter(n => n.startsWith('pre-')); } catch {}
+  for (const n of names) {
+    const rel = decPath(n.slice(4)), pre = getSnap(st, me, 'pre', rel), view = getSnap(st, me, 'view', rel), post = readText(st, rel);
+    putSnap(st, me, 'pre', rel, null);
+    if (pre == null || view == null || post == null) continue;
+    if (post === pre) { // the write did nothing, maybe because the text it expected had changed: say why, once per file
+      if (pre !== view && getSnap(st, me, 'told', rel) == null) {
+        putSnap(st, me, 'told', rel, '');
+        msgs.push(`mom: other agents are editing ${rel} at the same time as you, so it has changed since you read it. That is expected: re-read it and apply your change to its current text, leaving their edits in place.`);
+      }
+      continue;
+    }
+    if (pre === view) { putSnap(st, me, 'view', rel, post); continue; } // nobody else changed it: the agent knows this text
+    const m = merge3(view, pre, post);
+    if (!m || readText(st, rel) !== post) continue;
+    fs.writeFileSync(path.join(st.root, rel), m.text);
+    putSnap(st, me, 'view', rel, m.text);
+    st.log({ agent: me, type: 'restored', path: rel, n: m.restored.length });
+    const q = s => JSON.stringify(s.length > 70 ? s.slice(0, 67) + '...' : s);
+    const eg = m.restored.slice(0, 3).map(([a, b]) => `${q(a)} → ${q(b)}`).join('; ');
+    msgs.push(`mom: your last command wrote ${rel} from an out-of-date copy and undid ${m.restored.length} change${m.restored.length === 1 ? '' : 's'} another agent made since you last read it (${eg}${m.restored.length > 3 ? '; …' : ''}). mom put ${m.restored.length === 1 ? 'it' : 'them'} back and kept your own changes. If you undid any on purpose, undo it again now that you've seen it; otherwise carry on, and re-read ${rel} before writing it from memory again.`);
+  }
+  return msgs;
+}
 function gitStaged(root) {
   try { return cp.execFileSync('git', ['diff', '--cached', '--name-only'], { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).split('\n').filter(Boolean); } catch { return []; }
 }
@@ -659,6 +702,7 @@ function leave(st, me) {
   for (const c of mine) st.release(c.path, me);
   if (mine.length) st.log({ agent: me, type: 'handoff', released: mine.map(c => c.path), modified });
   st.log({ agent: me, type: 'leave' });
+  try { fs.rmSync(path.join(st.dir, 'snap', encodeURIComponent(me)), { recursive: true, force: true }); } catch {}
   st.removeAgent(me);
 }
 function sleepMs(ms) {
@@ -805,7 +849,7 @@ function runHook(st, event) {
       const rel = st.rel(p);
       if (!rel || rel.startsWith('.mom/')) return;
       const r = st.tryClaim(rel, me, { modified: true, observed: true });
-      if (r.ok) { recordWrite(st, me, rel); return; }
+      if (r.ok) { recordWrite(st, me, rel); beforeWrite(st, me, [rel]); return; }
       const owner = r.owner;
       const c = r.claim || {};
       const wholeFile = input.tool_name === 'Write';
@@ -815,7 +859,7 @@ function runHook(st, event) {
         a.overlaps = a.overlaps || {};
         const first = !a.overlaps[rel];
         a.overlaps[rel] = NOW(); st.saveAgent(a);
-        recordWrite(st, me, rel);
+        recordWrite(st, me, rel); beforeWrite(st, me, [rel]);
         st.log({ agent: me, type: 'overlap', path: rel, holder: c.agent });
         if (first) hookOut('PreToolUse', `mom: heads-up — ${rel} is also being edited right now by ${owner ? label(owner, me) : '[' + short(c.agent) + ']'}. Keep this edit small and local, don't reformat or rewrite the file, and re-Read it before further edits (its contents may change under you).${!Object.keys(a.overlaps).some(k => k !== rel) ? ' ' + COLLIDE_TIP(st.cmd) : ''}`);
         return;
@@ -832,6 +876,8 @@ function runHook(st, event) {
       ensureAgent(st, me);
       const rel = st.rel(String((input.tool_input || {}).file_path || ''));
       if (rel) noteSeen(st, me, [rel]);
+      const ti = input.tool_input || {};
+      if (rel && ti.offset == null && ti.limit == null) noteView(st, me, [rel]);
       return;
     }
     case 'pre-bash': {
@@ -858,7 +904,11 @@ function runHook(st, event) {
         process.exit(2);
       }
       noteSeen(st, me, files);
+      // `cat f` on its own (not piped into head etc.) shows the agent the whole file
+      const catted = cmd.split(/&&|\|\||;|\n/).filter(seg => /^\s*cat\s+[^|<>]+$/.test(seg)).join(' ');
+      if (catted) noteView(st, me, files.filter(f => catted.split(/\s+/).some(t => t && st.rel(path.resolve(cwd, t.replace(/^\.\//, ''))) === f)));
       for (const f of writes) recordWrite(st, me, f);
+      beforeWrite(st, me, writes);
       // Only agents with files in play can be affected by this command.
       const claimed = new Set(st.claims().map(c => c.agent));
       const others = st.liveAgents().filter(a => a.id !== me && (claimed.has(a.id) || Object.keys(a.edited || {}).length));
@@ -936,7 +986,7 @@ function runHook(st, event) {
     }
     case 'post-tool': {
       ensureAgent(st, me);
-      const parts = [];
+      const parts = afterWrite(st, me);
       const inbox = renderInbox(st, me);
       if (inbox) parts.push(inbox);
       if (parts.length) hookOut('PostToolUse', parts.join('\n'));

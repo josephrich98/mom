@@ -1,6 +1,6 @@
 {
   "name": "mom-cli",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "description": "Run several AI coding agents in one checkout without them overwriting each other: atomic file claims, change notes, commit hygiene. Claude Code plugin + CLI, zero dependencies.",
   "bin": {
     "mom": "bin/mom.js"
