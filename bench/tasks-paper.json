@@ -1,0 +1,11 @@
+{
+  "shared_suffix": "\n\nThe manuscript is manuscript.md in the project directory. Make only the changes described, and leave every other sentence as it is. When you are done, reply with a short summary of what you changed and anything you think the author should know.",
+  "agents": [
+    {"name": "term", "prompt": "We are changing our terminology. Replace the term \"intermittent drought\" with \"pulsed drought\" throughout the manuscript, including the title, table, and every section, preserving capitalization at the start of a sentence or title."},
+    {"name": "sample", "prompt": "The final dataset grew after late data were recovered. Update the manuscript everywhere these numbers appear: plots enrolled changes from 412 to 438; plot pairs change from 206 to 219; plots analyzed after quality control changes from 389 to 411."},
+    {"name": "units", "prompt": "The journal requires carbon fluxes in Mg C ha-1 yr-1. Convert every flux reported in g C m-2 yr-1 to Mg C ha-1 yr-1 (divide by 100, two decimals, e.g. 182 g C m-2 yr-1 becomes 1.82 Mg C ha-1 yr-1), throughout the abstract, results, discussion, and Table 1."},
+    {"name": "newresult", "prompt": "Add a new finding to the manuscript. The fungal-to-bacterial ratio fell from 0.42 under ambient rainfall to 0.31 in the drought treatment. Add it as (a) one sentence in Results, (b) one clause or sentence in the Abstract, and (c) one sentence in the Discussion that interprets it and cites Okafor and Petrov 2021, which is already in the reference list, in whatever citation style the manuscript uses. Keep the Abstract at or under 220 words."},
+    {"name": "citestyle", "prompt": "Convert all in-text citations from numeric style like [4] to author-year style like (Delacroix and Fernandez, 2015), using the first-author and second-author surnames and year from the reference list. Then remove the bracketed numbers from the start of each entry in the reference list and sort the list alphabetically by first author."},
+    {"name": "abstract-limits", "prompt": "Two edits. (1) Shorten the Abstract to at most 220 words, keeping every numerical result it reports. (2) Add a subsection titled \"### Limitations\" at the end of the Discussion, of three to five sentences, stating that the study covers a single site, a three-year duration, and possible artifacts of the shelters."}
+  ]
+}
