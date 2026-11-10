@@ -32,7 +32,7 @@ const SECTIONS = [
   { title: 'Code: 17-file shop CLI, 8 agents, 1 task each', groups: [
     { label: '1 agent at a time', base: ['hl-code-c1', 'baseline'], mom: ['hl-code-c1', 'mom-advisory'], k: true, build: true },
     { label: '3 at a time', base: ['hl-code-c3', 'baseline'], mom: ['hl-code-c3', 'mom-advisory'], k: true, build: true },
-    { label: 'All 8 at once', base: [['hl-code-c8', 'v8-code-c8'], 'baseline'], mom: ['v8-code-c8', 'mom-advisory'], k: true },
+    { label: 'All 8 at once', base: [['hl-code-c8', 'v8-code-c8', 'v9-code-c8', 'v9-code-c8b'], 'baseline'], mom: [['v8-code-c8', 'v9-code-c8', 'v9-code-c8b'], 'mom-advisory'], k: true },
   ] },
   { title: 'Writing: one manuscript, 6 agents, 1 edit each', groups: [
     { label: '1 agent at a time', base: ['hl-paper-c1', 'baseline'], mom: ['hl-paper-c1', 'mom-advisory'], k: true, build: true },

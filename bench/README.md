@@ -46,11 +46,11 @@ Agents are not told others are present, and all start at once (`--stagger 0`). B
 | fully correct runs | 7/20 | 16/20 |
 | runs that lost a whole task | 11/20 | 1/20 (v8 only) |
 | wall-clock, tokens (output + uncached input), cost | 45 s, 112k, $0.62 | 38 s, 112k, $0.60 |
-| Code, 8 at once (`v8-code-c8`, n = 5 + 5): checks passed | 72.4% (75.8% pooled with `hl-code-c8`, n = 10) | **99.1%** |
-| fully correct runs | 1/5 | 3/5 |
-| turns, cost | 75, $1.71 | 103, $2.02 (v0.5.1 `hl3`: 100, $2.07) |
+| Code, 8 at once (`v8-code-c8` + `v9-code-c8` + `v9-code-c8b`, n = 11 + 11): checks passed | 76.0% (76.9% pooled with `hl-code-c8`, n = 16) | **99.2%** |
+| fully correct runs | 2/11 | 8/11 |
+| turns, cost, median wall-clock | 79, $1.78, 103 s | 113, $2.10, 115 s (v0.5.1 `hl3`: 100 turns, $2.07) |
 
-v9 alone: 87.1% vs 99.7%, 4/10 vs 9/10 fully correct. On the shop the merge never fired (0 restores), and the overhead there is unchanged from v0.5.1: mom agents run about 70% more test runs, finishing work that uncoordinated runs lose. Every writing restore came from `abstract-limits` rewriting the abstract and undid 25–27 word-level changes from four other agents. The checker confirmed that its own trim (≤ 220 words) and its Limitations section survived. The remaining imperfect mom runs each left one "intermittent drought" in text that another agent added after `term` had finished: a semantic conflict, like the shop's leftover `priceCents` in new tier code, which no merge can catch.
+v9 alone: 87.1% vs 99.7%, 4/10 vs 9/10 fully correct. On the shop, v8 never restored anything. v9, which also records views from `cat` inside longer commands, restored 1–9 word-level changes 2–4 times per run, with no failures attributable to it. `v9-code-c8` lost 8 of 10 trials to the plan's usage limit; they are marked invalid. One `v9-code-c8b` mom run took 560 s because an agent polled `npm test` in its own `sleep 20` loop for 8 minutes. The overhead is otherwise unchanged from v0.5.1: mom agents run about 70% more test runs, finishing work that uncoordinated runs lose. Every writing restore came from `abstract-limits` rewriting the abstract and undid 25–27 word-level changes from four other agents. The checker confirmed that its own trim (≤ 220 words) and its Limitations section survived. The remaining imperfect mom runs each left one "intermittent drought" in text that another agent added after `term` had finished: a semantic conflict, like the shop's leftover `priceCents` in new tier code, which no merge can catch.
 
 ## Results v0.5.1 (2026-11-10, n = 10 per cell)
 
