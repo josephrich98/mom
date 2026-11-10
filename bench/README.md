@@ -58,6 +58,18 @@ Not replicated: v0.5's Haiku result (4/11 bad without mom on 11-06) was 0/10 on 
 
 Mixed Claude + Codex (`v3-shop-mixed`, 4 Codex agents per trial): 1 valid baseline trial (45/45). The mom trial was invalid when a Codex agent hit the ChatGPT plan's usage limit, the same as on 11-06.
 
+### Concurrency re-runs on v0.5.1 (`hl3-*`, n = 5)
+
+These are the "all at once" cells of the 11-09 concurrency experiment (`hl-*`, built by `report-conc.js`), re-run on v0.5.1 because the shell-write fixes loosened exactly the blocking that experiment relied on. Agents are not told others are present (`tasks-shop-blind.json`, `tasks-paper.json`), and every agent starts at once (`--stagger 0`).
+
+| | without mom | mom, 11-09 build (`hl`) | mom, v0.5.1 (`hl3`) |
+|---|---|---|---|
+| Code, 8 agents at once: checks passed | 79.1% (0/5 fully correct; `hl`) | 99.6% (4/5), 300 s | 98.7% (2/5), 120 s |
+| Code, 8 at once: wall-clock, tokens | 112 s, 314k | 300 s, 344k | 120 s, 335k |
+| Writing, 6 at once: checks passed | 97.1% (3/5; `hl3`) | 79.4% (0/5) | 96.6% (3/5) |
+
+v0.5.1 keeps most of the 8-agent protection at about 7% extra time rather than 2.7×. Its three imperfect runs each missed only `rename_no_old_names`, a leftover old identifier from the cross-cutting rename. The code baseline is from `hl-code-c8` (11-09/10), not re-run. On writing, mom made no difference at 6 at once, and the uncoordinated cell has ranged from 69% to 97% across three batches. All charts and the README table come from `node bench/charts.js`.
+
 ### Mixed Claude + Codex on the fast suite (`mixed-long`, v0.5.1, n = 5 / 4)
 
 To fit within the Codex plan's quota: the 3-agent `long` fixture, with `rename-due` run by Codex (`--codex half`) and the other two by Claude Sonnet 5.5. The run was stopped automatically when Codex hit its usage limit on trial 10, which leaves 5 baseline and 4 mom trials.

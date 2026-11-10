@@ -4,7 +4,7 @@
 
 mom keeps parallel AI coding agents (Claude Code sessions, Codex, Cursor, you) from destroying each other's work in the same repo. It is a zero-dependency CLI that installs as a Claude Code plugin. There is no supervising agent, no LLM call, and nothing written into your repo.
 
-It is a safety net, not a speed-up. In the common case it stays out of the way: in our benchmark, coordinated Sonnet agents cost about the same as uncoordinated ones (34 vs 36 turns, $0.60 vs $0.64). It speaks up only when agents actually collide: a whole-file overwrite of something another agent just changed, or a tree-wide git command in a shared checkout.
+It is a safety net, not a speed-up. In the common case it stays out of the way: in our benchmark, coordinated Sonnet agents cost about the same as uncoordinated ones (34 vs 36 turns, $0.60 vs $0.64). It speaks up only when agents actually collide: a whole-file overwrite of something another agent just changed, or a tree-wide git command in a shared checkout. Where that happens a lot, it matters: eight agents changing one 17-file codebase at once passed 79% of acceptance checks on their own and 99% with mom ([Numbers](#numbers)).
 
 ![two Claude Code sessions in one checkout; the second one is told what the first holds, is stopped from rewriting a file mid-edit, and is told exactly which files to commit](assets/demo.svg)
 
@@ -23,7 +23,7 @@ CLI for other agents and humans: `npm i -g mom-cli`. Per-repo opt-in without the
 
 From the benchmark transcripts (headless agents, one checkout, overlapping tasks, no coordination):
 
-- **They rewrite each other's files.** An agent that read the code once runs `cat > src/store.js <<EOF` with its own version and wipes out another agent's feature. In one 2026-11-06 batch, uncoordinated Haiku 5.5 agents left a broken tree in 4 of 11 trials (worst: 44% of checks). That rate did not replicate on 2026-11-10 (0 of 10), so treat it as how bad it can get, not how often.
+- **They rewrite each other's files.** An agent that read the code once runs `cat > src/store.js <<EOF` with its own version and wipes out another agent's feature. In one 2026-11-06 batch, uncoordinated Haiku 5.5 agents left a broken tree in 4 of 11 trials (worst: 44% of checks). That rate did not replicate on 2026-11-10 (0 of 10), so treat it as how bad it can get, not how often. With eight Sonnet agents changing one 17-file repo at once, none of 5 uncoordinated runs came out fully correct (79% of checks passed), against 99% with mom.
 - **They sweep up each other's half-finished work.** Told to commit when done, every uncoordinated Sonnet trial ran `git add -A` at least once. One agent ran `git update-ref` and `git reset` in the shared tree. mom blocks these deterministically and prints the exact `git add <your files>` to run instead.
 - **They give up and blame each other.** In an 8-agent run on a 17-file repo, a fifth of Sonnet agents stopped with the suite red: *"3 tests fail… All four failures come from another agent's shipping change."* The last agent standing cleaned up. (mom doesn't fix this one yet; see [Numbers](#numbers).)
 - **They invent their own coordination.** Uncoordinated Haiku agents wrote `sleep 60; md5sum src/*.js` and `until grep -q priorityOption src/cli.js; do sleep 1; done` to wait for each other.
@@ -58,31 +58,44 @@ If its test run comes back red while another agent is mid-edit, it is told whose
 
 ## Numbers
 
-Headless agents started five seconds apart in one checkout. Two fixtures:
-- **long:** a small todo CLI, three agents with two tasks each (ESM migration, async refactor, a field rename, due dates, priorities, `--json`/`edit`), 32 acceptance checks.
-- **shop:** a 17-file order-processing CLI, eight agents with overlapping features and one cross-cutting rename, 45 checks.
+Headless agents in one shared git checkout, no worktrees. Every chart compares the same tasks without mom (blue) and with mom's default settings (orange). Bars are means and dots are individual runs. Each run is scored by an acceptance checker that reads the final shared tree. The scenarios:
 
-n = 10 trials per cell, conditions interleaved, Sonnet 5.5 unless noted. A **bad run** is a final tree that fails any check. Full tables, the older n = 3 results and caveats: [bench/README.md](bench/README.md).
+- **Code, todo CLI:** 3 agents with 2 tasks each (ESM migration, async refactor, a field rename, due dates, priorities, `--json`/`edit`), 32 checks. Agents are told others are present.
+- **Code, shop CLI:** a 17-file order-processing CLI, 8 agents with one task each (a cross-cutting rename, tiers, coupons, loyalty, tax, shipping, …), 45 checks. Agents are *not* told others are present, and they run 1, 3 or all 8 at a time.
+- **Writing:** one 6-section ecology manuscript in Markdown, 6 agents with one edit each (terminology, updated sample sizes, unit conversion, a new result, citation style, abstract), 35 checks. Not told, and run 1, 3 or all 6 at a time.
 
-| Scenario | | without mom | with mom |
-|---|---|---|---|
-| **Fast suite**, 3 agents (the common case) | Bad runs | 0/10 | 0/10 |
-| | Turns, cost | 36.0, $0.64 | 34.3, $0.60 |
-| **15 s suite**, 3 agents | Bad runs | 1/10 | 1/10 |
-| | Cost, wall-clock p90 | $0.55, 195 s | $0.67, 201 s |
-| **Haiku 5.5**, 3 agents | Bad runs | 0/10 | 0/10 |
-| | Turns, cost | 100, $0.10 | 117, $0.11 |
-| **8 agents**, 17-file repo (v0.5, 2026-11-06) | Bad runs | 1/10 | 1/10 |
-| | Cost | $1.08 | $1.18 |
+![Correctness: share of acceptance checks passed, without and with mom, for each scenario](assets/charts/correctness.svg)
 
-v0.5.1, 2026-11-10, except the 8-agent row. Baselines and mom runs were measured hours apart on the same day.
+![Tokens per run, without and with mom, for each scenario](assets/charts/tokens.svg)
+
+![Wall-clock per run, without and with mom, for each scenario](assets/charts/time.svg)
+
+![Turns per run in the common case across mom versions: 36.0 without mom, 55.9 for v0.5 as first committed, 34.5 after the in-place-edit fixes, 34.3 for v0.5.1](assets/charts/versions.svg)
+
+| Scenario | Runs (without / with) | Fully correct runs | Checks passed | Tokens | Wall-clock |
+|---|---|---|---|---|---|
+| Code: todo CLI, Sonnet 5.5 | 10 / 10 | 10/10 → 10/10 | 100% → **100%** | 100k → 94k | 95 s → 86 s |
+| Code: todo CLI, Sonnet 5.5, 15 s test suite | 10 / 10 | 9/10 → 9/10 | 99.7% → **99.7%** | 88k → 104k | 152 s → 155 s |
+| Code: todo CLI, Haiku 5.5 | 10 / 10 | 10/10 → 10/10 | 100% → **100%** | 228k → 242k | 217 s → 269 s |
+| Code: todo CLI, Sonnet 5.5 + Codex | 5 / 4 | 5/5 → 4/4 | 100% → **100%** | 90k → 90k | 166 s → 179 s |
+| Code: 17-file shop CLI, 1 agent at a time † | 5 / 5 | 5/5 → 4/5 | 100% → **99.6%** | 240k → 244k | 311 s → 322 s |
+| Code: 17-file shop CLI, 3 at a time † | 5 / 5 | 4/5 → 5/5 | 97.3% → **100%** | 286k → 289k | 159 s → 196 s |
+| Code: 17-file shop CLI, All 8 at once | 5 / 5 | 0/5 → 2/5 | 79.1% → **98.7%** | 314k → 335k | 112 s → 120 s |
+| Writing: one manuscript, 1 agent at a time † | 5 / 5 | 5/5 → 5/5 | 100% → **100%** | 88k → 81k | 121 s → 120 s |
+| Writing: one manuscript, 3 at a time † | 5 / 5 | 3/5 → 3/5 | 95.4% → **96.0%** | 94k → 106k | 56 s → 63 s |
+| Writing: one manuscript, All 6 at once | 5 / 5 | 3/5 → 3/5 | 97.1% → **96.6%** | 112k → 112k | 44 s → 43 s |
+
+† ran the 2026-11-09 build of mom; every other mom row is v0.5.1. Measured 2026-11-09 and 2026-11-10 with Sonnet 5.5 unless noted. "Sonnet 5.5 + Codex" has one of the three agents run by Codex. Regenerate the charts and this table with `node bench/charts.js`. Full tables, older runs and caveats: [bench/README.md](bench/README.md).
 
 What this says, honestly:
 
-- **mom is close to free when nothing goes wrong.** In the common case it now matches no-mom on turns and cost. Getting here took three fixes in v0.5.1: the shell stale-write check had been blocking `sed -i` and read-then-write scripts, which work on the file's current text and can't lose anyone's change. That cost +55% turns (56 vs 36). On the slow suite and Haiku it still costs 15–20% more.
-- **Strong models rarely need saving.** Bad-run rates are about 0–1 in 10 with or without mom, for Sonnet and, on 2026-11-10, for Haiku. mom's measurable value is in the rare run that goes wrong: one v0.5.1 trial lost a feature to a blind `cat >` overwrite, which mom now blocks.
-- **Some earlier claims did not replicate.** "mom rescues Haiku" (4 of 11 bad without it, 2026-11-06) was 0 of 10 on 2026-11-10. At n = 3, mom seemed to stop agents abandoning a slow suite; at n = 10 it doesn't. Blocking `git add -A`/stash/reset is deterministic and doesn't depend on sampling.
-- **Caveats.** Two small synthetic repos, tasks that finish in minutes. Mixed Claude + Codex is measured only on the small repo with one Codex agent (n = 5 vs 4): 0 bad runs either way, Claude cost $0.35 vs $0.36, and mom tracked the Codex agent's writes in every trial. The 8-agent mixed runs could not run: the Codex plan's quota ran out after one trial pair, twice. Benchmark PRs on real repos are the most useful contribution.
+- **mom earns its keep when many agents edit the same code at once without knowing about each other.** With all 8 shop agents running together, uncoordinated runs passed 79% of checks, and none of 5 was fully correct: features vanished when another agent rewrote the file under them. With mom, 98.7% passed, at about 7% more tokens and time. Two runs were fully correct, and the other three each missed one leftover old name from the cross-cutting rename. When the same 8 tasks ran one or three at a time, both conditions scored 97–100%.
+- **Everywhere else, the final tree is about as correct with or without mom.** Sonnet, Haiku and Sonnet + Codex on the 3-agent repo were at or near 100% either way.
+- **Writing is not protected yet.** Six agents editing one manuscript at once scored 97.1% without mom and 96.6% with it. These are all small edits to one file, so mom let each through with a heads-up and blocked nothing. In the failing runs of both conditions, an old term or old sample sizes were still in the text at the end. Writing scores also swing a lot between batches: the same uncoordinated cell scored 84% (n = 5) and 69% (n = 2) on earlier days.
+- **Cost is close to neutral.** Tokens ranged from −6% (Sonnet, common case) to +18% (15 s suite), and wall-clock from −9% to +24% (Haiku). mom is a safety net, not a speed-up.
+- **The overhead chart is a warning about mom itself.** v0.5 as first committed blocked harmless in-place shell edits and cost 55% more turns. v0.5.1 is back to baseline. See [bench/README.md](bench/README.md#results-v051-2026-11-10-n--10-per-cell).
+- **Some earlier claims did not replicate.** "mom rescues Haiku" (4 of 11 uncoordinated trees broken on 2026-11-06) was 0 of 10 on 2026-11-10. At n = 3, mom seemed to stop agents abandoning a slow suite; at n = 10 it doesn't. Blocking `git add -A`, stash and reset is deterministic, so it doesn't depend on sampling.
+- **Caveats.** 5–10 runs per bar. Baseline and mom runs were measured in separate batches, sometimes on different days, and baselines drift by day. The repos are small and synthetic, and the tasks finish in minutes. The Codex runs have one Codex agent, because the plan's quota ran out on the 8-agent mixed runs. Benchmark PRs on real repos are the most useful contribution.
 
 ## How it works
 
