@@ -1,0 +1,37 @@
+{
+  "shared_suffix": "\n\nKeep the existing tests passing, add tests for your work, update README.md where relevant, and do NOT commit (leave your changes in the working tree). Finish by running `npm test` and making sure it is green.",
+  "agents": [
+    {
+      "name": "rename-price",
+      "prompt": "Two renames across this whole project (src/, test/, README.md). (1) Rename the field `priceCents` to `unitPriceCents` everywhere it is used: on products (stored JSON, models/product.js, catalog, CLI output code) and on order lines (models/order.js, pricing, orders, format). (2) Rename the pricing function `calcTotals` in src/services/pricing.js to `priceOrder` (same arguments and return value) and update every caller and test; do not keep `calcTotals` as an alias. Existing data files must keep working: `Store.load` in src/store.js must migrate products and order lines that still have `priceCents` to `unitPriceCents`, so the next save writes only the new field. That migration code in src/store.js is the only place in src/ allowed to mention `priceCents`; no file in src/ may mention `calcTotals`."
+    },
+    {
+      "name": "tiers",
+      "prompt": "Add quantity-break (tiered) pricing to products. New CLI command `product tier <sku> <minQty> <price>` adds a tier to the product, or replaces the existing tier with the same minQty; minQty must be an integer >= 2 and price a positive amount (same format as `product add`), otherwise exit non-zero with an error. Store tiers on the product in a `tiers` array. When pricing a line (quote and order place), the unit price is the price of the tier with the largest minQty that is <= the line's qty; if no tier applies, the product's normal price is used. Order lines must record the effective unit price that was charged. Tiers do not change any other pricing rule (discount codes, tax and shipping are computed from the resulting subtotal as before)."
+    },
+    {
+      "name": "coupons",
+      "prompt": "Extend discount codes with expiry and usage limits. `discount add <code> <type> <value> [--min <amount>] [--expires <YYYY-MM-DD>] [--max-uses <n>]`: `--expires` is the last day (inclusive, UTC) the code is valid; reject a malformed or impossible date with a non-zero exit. `--max-uses` is a positive integer; without it a code is unlimited. Each code tracks `uses` (starting at 0) in the data file. Every successful `order place` that uses a code increments its uses; `quote` never consumes a use. Using an expired code, or a code whose uses have reached max-uses, in `quote` or `order place` must fail with an error (non-zero exit) and must not create an order. `order cancel` of an order that used a code gives the use back (decrements uses). `discount list` must show each code's uses (and max uses when set) and its expiry date when set."
+    },
+    {
+      "name": "loyalty",
+      "prompt": "Add customer loyalty tiers. Each customer has `tier`: 'standard' | 'silver' | 'gold' (default 'standard'; customers in existing data files without a tier are 'standard'). `customer add <name> <email> [--region <code>] [--tier <tier>]` sets it, and a new command `customer tier <customerId> <tier>` changes it; any other tier value is an error (non-zero exit). `customer list` shows each customer's tier. Pricing: silver customers get 5% and gold customers 10% off the subtotal after the discount code has been applied (loyalty = round-half-up(5% or 10% of (subtotal - discount))). The loyalty amount reduces the taxable amount and counts toward the free-shipping threshold just like a discount code, so: merchandise = subtotal - discount - loyalty; tax and shipping are computed from merchandise; total = merchandise + tax + shipping. Add `loyalty` (integer cents, 0 when none) to the totals object returned by pricing and stored on orders, and print it in the `quote`/`order show` breakdown as a `Loyalty: -$X.XX` line (it may be omitted when zero)."
+    },
+    {
+      "name": "json",
+      "prompt": "Add a boolean `--json` flag that makes these commands print machine-readable JSON (and nothing else) on stdout instead of the text tables: `product list` (array of product objects as stored), `customer list` (array of customers), `discount list` (array of discount codes), `order list` (array of orders, after the --status/--customer filters), `order show <id>` (the order object) and `quote` (an object `{ customerId, lines, totals }` where `totals` holds integer cents for at least subtotal, discount, tax, shipping and total, plus any other components the pricing code produces). `--json` takes no value and must work in any position on the command line (e.g. `node src/cli.js order show --json O1` and `node src/cli.js order show O1 --json` both work), so fix the argument parser in src/cli.js to treat known boolean flags as value-less. Errors must still go to stderr with a non-zero exit."
+    },
+    {
+      "name": "report",
+      "prompt": "Add reporting. Create src/services/report.js and two CLI commands. (1) `report sales [--from <YYYY-MM-DD>] [--to <YYYY-MM-DD>]` covers orders whose status is paid or shipped and whose createdAt date (UTC, YYYY-MM-DD) is within [from, to] inclusive (either bound optional). It prints `Orders: <n>`, `Revenue: $<amount>` (sum of those orders' stored totals.total) and then one line per SKU with the SKU and the total units sold, most units first. Malformed dates are an error (non-zero exit). (2) `report low-stock [--threshold <n>]` (default 5) lists every product whose stock is at or below the threshold, lowest stock first, showing SKU, name and stock; print `(none)` when nothing matches. Reuse the existing inventory/money helpers rather than duplicating them."
+    },
+    {
+      "name": "tax-config",
+      "prompt": "Make tax rates configurable per data file. New CLI commands: `tax set <region> <percent>` (percent like `7.25`, 0-100, at most 2 decimals; region uses the same format as customer regions, e.g. `US-CA`, `DE`, `CA-ON`), `tax unset <region>` (remove an override), and `tax list` (print every effective region and its rate, e.g. `US-CA  7.25%`). Overrides are stored in the data file under `taxRates` as `{ region: basisPoints }` and are merged over the built-in DEFAULT_RATES in src/services/tax.js; they can also add regions that have no default. Invalid percentages or regions must fail with a non-zero exit. Quote and order place must use the effective rates for the customer's region, so thread the store's rates through src/services/tax.js and src/services/pricing.js instead of reading DEFAULT_RATES directly."
+    },
+    {
+      "name": "shipping-weight",
+      "prompt": "Replace flat-rate shipping with weight-based shipping. Products get `weightGrams` (integer >= 0, default 0; products in existing data files without it weigh 0): set it with `product add ... --weight <grams>` or the new command `product weight <sku> <grams>`; negative or non-integer weights are an error (non-zero exit). New shipping rules in src/services/shipping.js, where W = sum of weightGrams x qty over the order and units = ceil(W / 500): domestic (US-*) = $4.99 + $1.00 x units, still free when merchandise (subtotal after all discounts) >= $50.00; international = $19.99 + $3.00 x units, never free. Add a boolean `--express` flag to `quote` and `order place` that adds a flat $10.00 to shipping (even when standard shipping would be free); orders record `express: true|false`. Pass what shipping needs from src/services/pricing.js."
+    }
+  ]
+}

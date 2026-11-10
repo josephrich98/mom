@@ -1,0 +1,17 @@
+{
+  "kind": "deterministic protocol demonstration; no model calls",
+  "results": [
+    {
+      "condition": "baseline",
+      "features_preserved": 1,
+      "expected": 2,
+      "blocked_stale_rewrite": false
+    },
+    {
+      "condition": "codex-hooks",
+      "features_preserved": 2,
+      "expected": 2,
+      "blocked_stale_rewrite": true
+    }
+  ]
+}

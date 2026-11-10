@@ -9,7 +9,8 @@
     ],
     "PreToolUse": [
       { "matcher": "Edit|Write|MultiEdit|NotebookEdit", "hooks": [{ "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/bin/mom.js\" hook pre-edit", "timeout": 10 }] },
-      { "matcher": "Bash", "hooks": [{ "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/bin/mom.js\" hook pre-bash", "timeout": 10 }] }
+      { "matcher": "Bash", "hooks": [{ "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/bin/mom.js\" hook pre-bash", "timeout": 10 }] },
+      { "matcher": "Read", "hooks": [{ "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/bin/mom.js\" hook pre-read", "timeout": 10 }] }
     ],
     "PostToolUse": [
       { "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash|Task|Agent", "hooks": [{ "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/bin/mom.js\" hook post-tool", "timeout": 10 }] }

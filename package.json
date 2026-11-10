@@ -1,19 +1,48 @@
 {
   "name": "mom-cli",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Run several AI coding agents in one checkout without them overwriting each other: atomic file claims, change notes, commit hygiene. Claude Code plugin + CLI, zero dependencies.",
-  "bin": { "mom": "bin/mom.js" },
-  "files": ["bin", "hooks", "skills", ".claude-plugin", "README.md", "LICENSE"],
+  "bin": {
+    "mom": "bin/mom.js"
+  },
+  "files": [
+    "bin",
+    "hooks",
+    "skills",
+    ".claude-plugin",
+    "docs",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "test": "node --test test/*.test.js",
     "bench": "node bench/run.js",
-    "bench:report": "node bench/report.js"
+    "bench:report": "node bench/report.js",
+    "bench:codex": "node bench/codex.js",
+    "bench:contention": "node bench/contention.js"
   },
-  "engines": { "node": ">=18" },
-  "keywords": ["ai-agents", "claude-code", "codex", "cursor", "multi-agent", "coordination", "hooks", "file-locking", "developer-tools"],
-  "repository": { "type": "git", "url": "git+https://github.com/josephrich98/mom.git" },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "ai-agents",
+    "claude-code",
+    "codex",
+    "cursor",
+    "multi-agent",
+    "coordination",
+    "hooks",
+    "file-locking",
+    "developer-tools"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/josephrich98/mom.git"
+  },
   "homepage": "https://github.com/josephrich98/mom#readme",
-  "bugs": { "url": "https://github.com/josephrich98/mom/issues" },
+  "bugs": {
+    "url": "https://github.com/josephrich98/mom/issues"
+  },
   "author": "Joseph Rich",
   "license": "MIT"
 }

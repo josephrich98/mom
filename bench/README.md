@@ -1,14 +1,21 @@
 # Benchmark harness
 
-`run.js` starts N headless Claude Code agents (`claude -p`, `--permission-mode acceptEdits`, isolated `CLAUDE_CONFIG_DIR`, project settings only) five seconds apart in one fresh copy of `fixture/` (a 3-file todo CLI with tests), waits for all of them, runs the scenario's acceptance checker, and parses each agent's `stream-json` transcript for cost, tokens, turns, tool errors, mom blocks, whole-file writes, tree-wide git commands, how often an agent saw a failing `npm test`, and whether its final message admits the suite is red.
+`run.js` starts N headless agents five seconds apart in one fresh copy of a fixture repo: Claude Code (`claude -p`, `--permission-mode acceptEdits`, isolated `CLAUDE_CONFIG_DIR`, project settings only) and, optionally, Codex (`codex exec`, workspace-write sandbox, user config ignored). It waits for all of them, runs the scenario's acceptance checker, and parses each transcript for cost, tokens, turns, tool errors, mom blocks, whole-file writes, tree-wide git commands, how often an agent saw a failing test run, and whether its final message admits the suite is red.
 
 ```
-node bench/run.js --condition baseline|mom-advisory|mom-strict \
-  [--trials 3] [--model claude-sonnet-5-5] [--max-turns 100] [--stagger 5] [--slow 15] \
-  [--tasks bench/tasks-long.json --check bench/check-long.js --tag long]
-node bench/report.js bench/results-<tag>.jsonl        # mean ± sd table per condition
-node bench/rescore.js --tag <tag> --check <checker>   # re-score saved trials after changing a checker or metric
+node bench/run.js --conditions baseline,mom-advisory --trials 10 --parallel 2 \
+  [--model claude-sonnet-5-5] [--max-turns 100] [--stagger 5] [--slow 15] [--timeout 1200] \
+  [--fixture bench/fixture-shop --tasks bench/tasks-shop.json --check bench/check-shop.js] --tag shop \
+  [--codex half|<agent names>] [--codex-model gpt-6-astra] [--mom-src <frozen copy with bin/ skills/>]
+node bench/report.js bench/results-<tag>.jsonl                 # tail metrics first, then means ± sd per condition
+node bench/rescore.js --tag <tag> [--check <checker>|--no-check] # re-score / re-parse saved trials
 ```
+
+Conditions: `baseline` (no mom) · `mom-advisory` (the default install) · `mom-full` (advisory mode with `--brief full`) · `mom-strict`.
+
+- **Counterbalanced:** trial *k* runs every condition, in an order that rotates with *k*; `--parallel` runs that many at once.
+- **Frozen code:** mom's `bin/` and `skills/` are copied into each trial directory, from `--mom-src` if given, and the row records the hash. Editing the repo during a run cannot change what a trial executes.
+- **Failures kept, not silently dropped:** a trial is marked `valid: false` (and excluded by `report.js`, which counts the exclusions) when an agent's run failed for reasons that aren't the agent's outcome: API credit exhausted, Codex usage limit, harness error, or a mom condition whose hooks never fired. Agent timeouts are valid outcomes and are reported.
 
 ## Scenarios
 
@@ -19,11 +26,56 @@ node bench/rescore.js --tag <tag> --check <checker>   # re-score saved trials af
 | `slow` | 3 × 2 tasks | same as `long` | `--slow 15`: a 15 s integration test | `check-long.js` |
 | `six` | 6 × 1 task | the same six features as six agents | | `check-long.js` |
 | `haiku` | 3 × 2 tasks | same as `long` | `--model claude-haiku-5-5` | `check-long.js` |
+| `shop` | 8 × 1 task | eight overlapping features/refactors in a 17-file order-processing CLI (`fixture-shop/`): a cross-cutting rename, tiered pricing, coupons, loyalty, `--json`, reports, tax config, shipping by weight. 5 tasks touch `pricing.js`, all 8 touch `cli.js` | | `check-shop.js` (45) |
+| `shop-mixed` | 4 Claude + 4 Codex | same as `shop` | `--codex half` | `check-shop.js` |
 | `medium`, `hard` | 3 × 1 | earlier, smaller scenarios (see git history) | | `check.js`, `check-hard.js` (23) |
 
 The long/commit/slow/haiku prompts are in `tasks-long.json` / `tasks-commit.json`; `tasks-six.json` splits the same work six ways. All agents are told that other agents are working in the checkout.
 
-## Results (2026-11-04, n = 3 per cell)
+## Results v0.5 (2026-11-06, n = 10 per cell)
+
+mom at sha256 `652c5531…` (lean brief; before the idle-claim change below). Sonnet 5.5 unless noted. "Bad run" = the final shared tree fails any acceptance check (lost work, a broken build, or an unfinished feature). "Quit red" counts agents (3 per trial; 8 for `shop`) whose final message says the suite is failing. Raw rows: `results-n10-<tag>.jsonl`.
+
+| Scenario | Metric | baseline | mom (lean, default) | mom (full v0.4 brief) |
+|---|---|---|---|---|
+| **long**: fast suite, 3 × 2 tasks | Bad runs | 1/10 | 0/10 | 0/10 |
+| | Cost per trial | $0.47 | $0.48 | $0.58 |
+| | Turns | 30.7 | 30.7 | 69.1 |
+| | Wall-clock (mean / p90) | 89 s / 114 s | 101 s / 126 s | 120 s / 143 s |
+| | mom commands run by agents | 0 | 0.6 | 11.2 |
+| **slow**: 15 s suite, 3 × 2 tasks | Bad runs | 0/10 | 0/10 | 1/10 |
+| | Agents that quit red | 4 of 30 | 2 of 30 | 0 of 30 |
+| | Cost | $0.45 | $0.41 | $0.51 |
+| | Turns | 28.6 | 25.6 | 53.9 |
+| | Wall-clock (mean / p90) | 154 s / 200 s | 143 s / 169 s | 184 s / 227 s |
+| **haiku**: Haiku 5.5, 3 × 2 tasks | Bad runs | **4/11** | 1/10 | **0/10** |
+| | Worst acceptance | 44% | 72% | 100% |
+| | Stale-read / edit-mismatch errors | 5.0 | 4.8 | 0.3 |
+| | Agent timeouts (20 min) | 0 | 4 | 1 |
+| | Wall-clock (mean / p90) | 192 s / 276 s | 575 s / 1205 s | 403 s / 698 s |
+| | Cost | $0.09 | $0.09 | $0.09 |
+| **shop**: 8 agents, 17-file repo | Bad runs | 1/10 | 1/10 | – |
+| | Agents that quit red | 16 of 80 | 19 of 80 | – |
+| | Cost | $1.08 | $1.18 | – |
+| | Turns | 64 | 89 (one trial 191) | – |
+| | Wall-clock (mean / p90) | 115 s / 125 s | 124 s / 148 s | – |
+
+What this says:
+
+- **The overhead is gone in the common case.** With the lean brief, Sonnet agents on a fast suite cost what uncoordinated agents cost: same turns, same tokens, +2% dollars, wall-clock within noise. The v0.4 brief cost +23% and 2.25× the turns there, for the same outcome.
+- **Strong models mostly don't need it, even with 8 agents.** Sonnet's bad-run rate is about 1 in 10 with or without mom, on both repos. In `shop`, mom cost about 9% more for no measurable gain. A fifth of Sonnet agents stop with the suite red and blame another agent's half-done work, and mom's red-test attribution didn't change that. The last agent standing still cleans up, so every final suite was green.
+- **The tail is real for weaker models.** Uncoordinated Haiku left a broken tree in 4 of 11 trials (worst: 44% of checks). The full brief prevented all of them, at about 2× wall-clock. The lean brief prevented most of them, but stale reads stayed at baseline levels, and 4 agents hung until the 20-minute timeout. They were polling `mom status` for each other's files, which stay claimed until a turn ends, and in a headless run the turn is the whole run.
+- **n = 3 claims that did not replicate at n = 10.** The earlier "3 of 9 agents quit red without mom → 0 of 9" and "240 s → 173 s" in the slow scenario: at n = 10 it is 4 of 30 vs 2 of 30, and 154 s vs 143 s. The six-agent and commit scenarios were not re-run. `git add -A`, stash and reset are blocked deterministically, so the commit result doesn't depend on sampling.
+
+### v0.5 idle claims (partial, n = 2–7)
+
+The Haiku hangs led to one change: a hook-observed claim with edits goes cold after 90 s without edits by its holder (`MOM_IDLE_SEC`), and whoever takes it next is told to re-read. The lean brief also gained "re-read right before you edit". Unit tests cover the hang. The validation run (`results-v2-*.jsonl`) was cut short when the benchmark account's API credit ran out: 43 of 70 trials are marked invalid ("Credit balance is too low"). In the 27 valid trials, mom had no bad runs (0 of 14 trials); baseline had 1 of 13. On the fast suite (n = 6 vs 7) lean mom took 41 turns against baseline's 29, and cost $0.54 vs $0.47. That's noise-level n, so treat the cost of this change in the common case as unmeasured.
+
+### shop-mixed (4 Claude + 4 Codex): not measured
+
+Only 1 of 11 trials is valid. The Codex agents hit the ChatGPT plan's usage limit after the first trial, and were marked invalid rather than scored as failures. Before that, two smoke trials (2 Claude + 1 Codex, `long` tasks, mom on) scored 32/32 and showed the Codex adapter working. The first one also exposed a bug, now fixed: mom matched agent hosts by command-line text. A Codex process whose command line mentions `mom.js` (as its hook flags do), or a checkout path containing "mom", was never treated as the live host. Its record was dropped on nearly every hook call, so its claims never held. **The earlier Codex pilot (`CODEX-RESULTS.md`) ran with this bug.**
+
+## Results v0.4 (2026-11-04, n = 3 per cell; superseded where re-run above)
 
 Sonnet 5.5 unless noted. "Thrash" = times any agent saw a red `npm test`. "Quit red" = agents whose final message says the suite is failing. Means ± sd across trials.
 
@@ -100,4 +152,49 @@ The one red commit in each condition is the same agent (`esm-async`) committing 
 
 ## Caveats
 
-n = 3, one small fixture, synthetic tasks that finish in minutes, agents told up front that others are present. Per-trial transcripts are not committed (`runs/` is git-ignored) but `run.js` regenerates them; the `results-*.jsonl` rows are. Scenarios on bigger repos, with Codex/Cursor agents, or with a human editing alongside are the contributions that would move the conclusions most.
+n = 10 (v0.5) or 3 (v0.4), two small fixtures, synthetic tasks that finish in minutes, agents told up front that others are present. Per-trial transcripts are not committed (`runs/` is git-ignored) but `run.js` regenerates them; the `results-*.jsonl` rows are. Scenarios on bigger repos, with Codex/Cursor agents, or with a human editing alongside are the contributions that would move the conclusions most.
+
+## Codex
+
+```sh
+npm run bench:codex -- --trials 3 --model <installed-model>
+node bench/codex.js --conditions baseline,instructions,mom-advisory,mom-strict --trials 10
+```
+
+The separate runner uses real `codex exec` processes, the same task/checker files,
+fresh checkouts per condition, five-second staggering, and counterbalanced order
+across paired trials. `--tasks`, `--check`, `--stagger`, `--timeout` (seconds per
+agent), and `--output` are configurable. The default model is Codex's default with
+user config ignored; pin `--model` for comparisons. User-level hooks/configuration
+can vary by CLI version; inspect transcripts and hook events before pooling runs.
+
+Only generated mom hooks receive the CLI hook-trust bypass for the trial; this is
+automation of locally reviewed code. Normal installations require `/hooks` review.
+The runner uses workspace-write sandboxing and in-checkout mom state. The baseline
+sets MOM_DISABLE=1. It does not alter your working checkout or user hook settings.
+
+Results are JSONL with CLI version, task hash, acceptance checks, elapsed time,
+per-agent exit status, timeout flags, token usage and mom event/block counts.
+Transcripts remain under `bench/runs/codex/`. Errors/timeouts remain in results;
+do not silently discard them or interpret authentication failures as task failures.
+The instructions-only arm is an ablation of coordination advice, not enforcement.
+Inspect that mom arms have hook events; zero events means integration was inactive.
+
+A small run demonstrates integration and supplies exploratory observations, not
+statistical proof. Compare final acceptance and lost work first, then elapsed time
+and tokens. Report all trials. Use multiple repositories and overlapping and
+independent tasks before claiming a general model-performance improvement.
+
+### Controlled lost-update demonstration
+
+`npm run bench:contention` reproduces two workers reading the same old file and
+attempting destructive replacements. Without hooks, only the second feature
+survives. With the Codex adapter, the stale replacement is blocked; release,
+reacquisition and re-reading preserve both features. Results are recorded in
+`results-contention.json`. This is a deterministic protocol demonstration with
+no model calls; it must not be described as a Codex model-quality benchmark.
+
+The first live integration pilot is reported in [CODEX-RESULTS.md](CODEX-RESULTS.md).
+Both valid conditions passed 32/32; mom was slower in that one trial. The initial
+inactive-hook attempt is retained and marked invalid. This is useful diagnostic
+evidence, not a claimed Codex performance win.

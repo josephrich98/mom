@@ -6,10 +6,10 @@
  * Zero dependencies. State is plain files, kept per checkout:
  *   ~/.mom/repos/<hash of repo root>/   by default (nothing is written into your repo), or
  *   <repo>/.mom/                        if you ran `mom init` there (shared with other tools, git-ignored)
- *     agents/<id>.json   one record per live agent (plan, pid, heartbeat, inbox cursor, files edited)
+ *     agents/<id>.json   one record per live agent (pid, heartbeat, inbox cursor, files edited)
  *     claims/<path>.json one record per claimed file; created with O_EXCL so
  *                        "check and claim" is a single atomic filesystem operation
- *     log.jsonl          append-only event log (plans, notes, handoffs)
+ *     log.jsonl          append-only event log (notes, handoffs)
  *
  * Agents never need to read these files; they use `mom <cmd>` and the
  * Claude Code hooks (`mom hook <event>`) do the rest automatically.
@@ -20,10 +20,14 @@ const os = require('os');
 const cp = require('child_process');
 const crypto = require('crypto');
 
-const VERSION = '0.4.0';
+const VERSION = '0.5.0';
 const MOM_HOME = process.env.MOM_HOME || path.join(os.homedir(), '.mom');
 const TTL_SEC = parseInt(process.env.MOM_TTL_SEC || '', 10) || 900; // reservation TTL
 const TTL_MS = TTL_SEC * 1000;
+// A hook-observed claim with edits stays "hot" (blocking, shown as mid-edit) only while its holder keeps editing that
+// file. In headless runs and long turns the turn never ends, so holding until end-of-turn serialized agents behind
+// files their holder had finished with minutes earlier.
+const IDLE_MS = (parseInt(process.env.MOM_IDLE_SEC || '', 10) || 90) * 1000;
 const HOST = os.hostname();
 const NOW = () => Date.now();
 
@@ -42,7 +46,7 @@ function ago(ts) {
   if (s < 3600) return `${Math.round(s / 60)}m ago`;
   return `${(s / 3600).toFixed(1)}h ago`;
 }
-function short(id) { return String(id || '').replace(/-/g, '').slice(0, 4); }
+function short(id) { const value = String(id || ''); return value.length <= 8 ? value.replace(/-/g, '').slice(0, 4) : crypto.createHash('sha256').update(value).digest('hex').slice(0, 6); }
 function encPath(rel) { return encodeURIComponent(rel).replace(/\./g, '%2E') + '.json'; }
 function decPath(name) { return decodeURIComponent(name.replace(/\.json$/, '')); }
 function pidAlive(pid) {
@@ -53,12 +57,6 @@ function out(s) { if (s) process.stdout.write(s.endsWith('\n') ? s : s + '\n'); 
 function die(msg, code = 1) { process.stderr.write(`mom: ${msg}\n`); process.exit(code); }
 
 // ---------------------------------------------------------------- root / state dir
-function ancestorWith(start, name) {
-  for (let d = path.resolve(start); ; d = path.dirname(d)) {
-    if (fs.existsSync(path.join(d, name))) return d;
-    if (path.dirname(d) === d) return null;
-  }
-}
 function globalDir(root) {
   let real = root; try { real = fs.realpathSync(root); } catch {}
   return path.join(MOM_HOME, 'repos', crypto.createHash('sha1').update(real).digest('hex').slice(0, 16));
@@ -106,13 +104,35 @@ class State {
    *  operations are blocked (whole-file Write / shell rewrite of a held file, tree-wide git ops).
    *  'strict': any edit to a file another agent holds is blocked. */
   get mode() { return process.env.MOM_MODE || this.cfg.mode || 'advisory'; }
+  /** Opt-in (`mom init --brief full`, MOM_BRIEF=full): teach the whole protocol up front and show status with every prompt.
+   *  About 2x the turns; for weaker models that rewrite whole files. Default: silent unless agents share a file. */
+  get fullBrief() { return (process.env.MOM_BRIEF || this.cfg.brief) === 'full'; }
   /** Enabled in any git checkout (or anywhere with a .mom/) unless MOM_DISABLE is set. */
   get enabled() { return !!this.dir && !process.env.MOM_DISABLE; }
   ensure() {
     if (!this.dir) die('not inside a git repository (or a directory with .mom/). Run `mom init` here, or set MOM_ROOT.');
     fs.mkdirSync(this.agentsDir, { recursive: true });
     fs.mkdirSync(this.claimsDir, { recursive: true });
-    if (!fs.existsSync(this.logFile)) fs.writeFileSync(this.logFile, '');
+    fs.closeSync(fs.openSync(this.logFile, 'a')); // never truncate a concurrent append
+  }
+  // Serialize claim mutation, including expiry checks. Never reap this mutex by
+  // pathname: doing so would reintroduce the ABA race it protects against.
+  locked(fn) {
+    if (this._locked) return fn();
+    this.ensure();
+    const lock = path.join(this.dir, 'mutation.lock');
+    const deadline = NOW() + 5000;
+    for (;;) {
+      try { fs.mkdirSync(lock); break; }
+      catch (e) {
+        if (e.code !== 'EEXIST') throw e;
+        if (NOW() >= deadline) throw new Error(`State mutex busy: ${lock}. If its process crashed, stop all mom users before removing this directory.`);
+        sleepMs(10);
+      }
+    }
+    this._locked = true;
+    try { return fn(); }
+    finally { this._locked = false; fs.rmdirSync(lock); }
   }
   rel(p) {
     const abs = path.isAbsolute(p) ? p : path.resolve(this.root, p);
@@ -153,17 +173,22 @@ class State {
     if (!c) return false;
     const owner = agentsById ? agentsById[c.agent] : this.getAgent(c.agent);
     if (!this.isPresent(owner)) return false;
-    if (c.modified) return true; // uncommitted edits: hold until release or owner death
+    if (c.modified) {
+      // hookless claims (`mom begin`) report no edit times: hold until release or owner death.
+      // Hook-observed claims go cold once their holder has not touched the file for IDLE_MS.
+      return !c.lastEdit || NOW() - c.lastEdit < IDLE_MS;
+    }
     return (c.expires || 0) > NOW();
   }
   /**
    * Try to claim `rel` for `me`. Returns {ok:true, claim} or {ok:false, claim(holder), owner}.
-   * Atomic: creation uses O_EXCL; stealing a stale claim uses rename() so only one stealer wins.
+   * Atomic: creation uses O_EXCL; stale replacement is serialized by the state mutex.
    */
-  tryClaim(rel, me, { modified = false, steal = false } = {}) {
+  tryClaim(rel, me, { modified = false, steal = false, observed = false } = {}) {
+    if (!this._locked) return this.locked(() => this.tryClaim(rel, me, { modified, steal, observed }));
     const file = this.claimFile(rel);
     for (let attempt = 0; attempt < 5; attempt++) {
-      const fresh = { path: rel, agent: me, since: NOW(), expires: NOW() + TTL_MS, modified, renewed: NOW() };
+      const fresh = { path: rel, agent: me, since: NOW(), expires: NOW() + TTL_MS, modified, renewed: NOW(), ...(observed ? { lastEdit: NOW() } : {}) };
       try {
         const fd = fs.openSync(file, 'wx');
         fs.writeSync(fd, JSON.stringify(fresh));
@@ -177,19 +202,22 @@ class State {
       if (existing.agent === me) {
         existing.expires = NOW() + TTL_MS; existing.renewed = NOW();
         if (modified) { existing.modified = true; existing.edits = (existing.edits || 0) + 1; }
+        if (observed) existing.lastEdit = NOW();
         writeJSONAtomic(file, existing);
         return { ok: true, claim: existing, fresh: false };
       }
       if (this.claimValid(existing) && !steal) {
         return { ok: false, claim: existing, owner: this.getAgent(existing.agent) };
       }
-      // stale (or forced): reap via rename so concurrent reapers can't both succeed
+      // Stale replacement is protected by the state mutex. A cold claim with edits is a handoff: whoever takes it next re-reads.
+      if (existing.modified && existing.lastEdit) this.log({ agent: existing.agent, type: 'handoff', released: [rel], modified: [rel], idle: true });
       const tomb = `${file}.reap.${process.pid}.${Math.random().toString(36).slice(2)}`;
       try { fs.renameSync(file, tomb); fs.unlinkSync(tomb); } catch { /* someone else reaped; loop */ }
     }
     return { ok: false, claim: this.getClaim(rel), owner: null };
   }
   release(rel, me) {
+    if (!this._locked) return this.locked(() => this.release(rel, me));
     const file = this.claimFile(rel);
     const c = readJSON(file, null);
     if (!c || c.agent !== me) return null;
@@ -197,6 +225,7 @@ class State {
     return c;
   }
   renewAll(me) {
+    if (!this._locked) return this.locked(() => this.renewAll(me));
     for (const c of this.claims()) {
       if (c.agent === me && NOW() - (c.renewed || 0) > TTL_MS / 4) {
         c.expires = NOW() + TTL_MS; c.renewed = NOW();
@@ -215,17 +244,30 @@ class State {
     return { events, end: buf.length };
   }
   gc() {
+    if (!this._locked) return this.locked(() => this.gc());
     const agents = this.agents();
     const present = {};
     for (const a of agents) { if (this.isPresent(a)) present[a.id] = a; else this.removeAgent(a.id); }
     for (const c of this.claims()) {
-      if (!this.claimValid(c, present)) { try { fs.unlinkSync(this.claimFile(c.path)); } catch {} }
+      if (!this.claimValid(c, present)) {
+        try { fs.unlinkSync(this.claimFile(c.path)); } catch {}
+        if (c.modified && c.lastEdit && present[c.agent]) this.log({ agent: c.agent, type: 'handoff', released: [c.path], modified: [c.path], idle: true });
+      }
     }
     return present;
   }
 }
 
 // ---------------------------------------------------------------- identity
+/** Is this process an agent CLI? Judge by the executable (or, for node/python launchers, the script) name only:
+ *  the rest of the command line can mention anything, including mom itself (hook flags, a checkout called mom). */
+const AGENT_EXE = /^(claude|codex|cursor|cursor-agent|aider|gemini|copilot|opencode)(\.(js|mjs|cjs|exe|py))?$/i;
+function isAgentHost(cmdline) {
+  const argv = cmdline.trim().split(/\s+/);
+  const base = x => path.basename(String(x || ''));
+  if (AGENT_EXE.test(base(argv[0]))) return true;
+  return /^(node|nodejs|bun|deno|python3?)(\.exe)?$/i.test(base(argv[0])) && AGENT_EXE.test(base(argv.find((x, i) => i > 0 && !x.startsWith('-'))));
+}
 function hostPidFromAncestors() {
   // Walk up the process tree looking for the agent host (claude, codex, cursor…).
   let pid = process.ppid, found = null, first = process.ppid;
@@ -241,7 +283,7 @@ function hostPidFromAncestors() {
         ppid = parseInt(line, 10); cmd = line.replace(/^\s*\d+\s*/, '');
       }
     } catch { break; }
-    if (/\b(claude|codex|cursor|aider|gemini|copilot|opencode)\b/i.test(cmd) && !/mom/.test(cmd)) { found = pid; break; }
+    if (isAgentHost(cmd)) { found = pid; break; }
     pid = ppid;
   }
   return found || first;
@@ -260,10 +302,11 @@ function resolveSelf(st, hookInput, flags) {
   return null;
 }
 function ensureAgent(st, id, extra = {}) {
+  if (!st._locked) return st.locked(() => ensureAgent(st, id, extra));
   let a = st.getAgent(id);
   const fresh = !a;
   if (!a) {
-    a = { id, host: HOST, pid: parseInt(process.env.CLAUDE_PID, 10) || hostPidFromAncestors(), started: NOW(), plan: null, cursor: st.logSize(), cwd: st.root };
+    a = { id, host: HOST, pid: parseInt(process.env.CLAUDE_PID, 10) || hostPidFromAncestors(), started: NOW(), cursor: st.logSize() };
   }
   a.heartbeat = NOW();
   Object.assign(a, extra);
@@ -327,35 +370,39 @@ function renderStatus(st, me, { compact = false } = {}) {
   }
   return lines.join('\n');
 }
-function renderInbox(st, me, { advance = true } = {}) {
+function renderInbox(st, me) {
   const meRec = st.getAgent(me);
+  // Only files this agent has edited, holds, or is waiting for concern it.
+  const mine = { ...((meRec && meRec.edited) || {}) };
+  for (const c of st.claims()) if (c.agent === me) mine[c.path] = 1;
+  if (meRec && meRec.waiting_for) mine[meRec.waiting_for] = 1;
   const from = meRec ? (meRec.cursor || 0) : 0;
   const { events, end } = st.readLog(from);
-  if (meRec && advance && end !== from) { meRec.cursor = end; st.saveAgent(meRec); }
+  if (meRec && end !== from) { meRec.cursor = end; st.saveAgent(meRec); }
   const present = st.gc();
+  const full = st.fullBrief;
+  const sharesFile = id => Object.keys((present[id] && present[id].edited) || {}).some(f => mine[f]);
   const lines = [];
   for (const e of events) {
     if (e.agent === me) continue;
     const who = present[e.agent] ? label(present[e.agent], me) : `[${short(e.agent)}]`;
-    switch (e.type) {
-      case 'join': lines.push(`${who} started working in this repo.`); break;
-      case 'leave': lines.push(`${who} finished and left.`); break;
-      case 'plan': lines.push(`${who} plan: "${e.text}"${e.files && e.files.length ? ` (files: ${e.files.join(' ')})` : ''}`); break;
-      case 'note': lines.push(`${who} note: ${e.text}`); break;
-      case 'handoff':
-        if (e.modified && e.modified.length) lines.push(`${who} released edited file${e.modified.length === 1 ? '' : 's'}: ${e.modified.join(' ')} — re-read before editing (your earlier read is stale).`);
-        break;
-      case 'overlap': {
-        const mine = st.getClaim(e.path);
-        if (e.holder === me && mine && mine.agent === me) lines.push(`${who} also edited ${e.path}, which you hold — re-Read it before your next edit to it.`);
-        break;
-      }
-      case 'blocked': break;
-      default: break;
+    if (full && e.type === 'join') lines.push(`${who} started working in this repo.`);
+    else if (full && e.type === 'leave') lines.push(`${who} finished and left.`);
+    else if (full && e.type === 'plan') lines.push(`${who} plan: "${e.text}"${e.files && e.files.length ? ` (files: ${e.files.join(' ')})` : ''}`);
+    else if (e.type === 'note') {
+      if (full || sharesFile(e.agent)) lines.push(`${who} note: ${e.text}`);
+    } else if (e.type === 'handoff') {
+      const files = (e.modified || []).filter(f => full || mine[f]);
+      if (files.length) lines.push(`${who} released edited file${files.length === 1 ? '' : 's'}: ${files.join(' ')} — re-read before editing (your earlier read is stale).`);
+    } else if (e.type === 'overlap' && e.holder === me) {
+      const held = st.getClaim(e.path);
+      if (held && held.agent === me) lines.push(`${who} also edited ${e.path}, which you hold — re-Read it before your next edit to it.`);
     }
   }
   return lines.length ? `mom — updates from other agents:\n- ${lines.join('\n- ')}` : '';
 }
+
+const COLLIDE_TIP = cmd => `If you change an interface other code calls (signature, field, flag, export), tell the others: \`${cmd} note "<what changed>"\`. \`${cmd} status\` shows who holds what.`;
 
 const BRIEF = (others, cmd, mode) => [
   `mom is active: ${others} other agent${others === 1 ? ' is' : 's are'} working in this repo right now.`,
@@ -365,7 +412,7 @@ const BRIEF = (others, cmd, mode) => [
   `Protocol (cheap, do it): 1) Before your first edit run \`${cmd} plan "<one-line goal>" <files you expect to touch>\`.`,
   `2) If you change a shared interface (signature, schema, CLI flag, export), run \`${cmd} note "<what changed>"\`.`,
   `3) If blocked: work on your other files first, or \`${cmd} wait <file>\` (blocks until free), then re-read the file before editing. When you are done with a file others may need, \`${cmd} release <file>\` early.`,
-  `4) Commit only your own files: \`git add $(${cmd} mine) && git commit\`. Never \`git add -A\`/\`commit -a\`, stash, reset, or checkout/restore the whole tree: other agents have uncommitted work here. \`${cmd} status\` shows who holds what.`,
+  `4) Coordinate one committer and review the whole staged diff: \`${cmd} mine --json\` lists files, not hunk ownership. Never \`git add -A\`/\`commit -a\`, stash, reset, or checkout/restore the whole tree: other agents have uncommitted work here. \`${cmd} status\` shows who holds what.`,
 ].join('\n');
 
 // ---------------------------------------------------------------- commands
@@ -377,7 +424,7 @@ function parseArgs(argv) {
     if (a.startsWith('--')) {
       const [k, v] = a.slice(2).split('=');
       if (v !== undefined) flags[k] = v;
-      else if (i + 1 < argv.length && !argv[i + 1].startsWith('-') && ['as', 'timeout', 'command', 'settings', 'root', 'n', 'mode'].includes(k)) flags[k] = argv[++i];
+      else if (i + 1 < argv.length && !argv[i + 1].startsWith('-') && ['as', 'timeout', 'command', 'settings', 'root', 'n', 'mode', 'brief'].includes(k)) flags[k] = argv[++i];
       else flags[k] = true;
     } else pos.push(a);
   }
@@ -393,7 +440,23 @@ function needSelf(st, flags) {
 }
 /** Files this agent has edited in this session (never released; used to scope commits). */
 function myEdits(st, me) { const a = st.getAgent(me); return Object.keys((a && a.edited) || {}).sort(); }
-function noteEdit(st, me, rel) { const a = st.getAgent(me); if (!a) return; a.edited = a.edited || {}; a.edited[rel] = NOW(); st.saveAgent(a); }
+function noteEdit(st, me, rel) { if (!st._locked) return st.locked(() => noteEdit(st, me, rel)); const a = st.getAgent(me); if (!a) return; a.edited = a.edited || {}; a.edited[rel] = NOW(); st.saveAgent(a); }
+/** Remember when this agent last looked at these files; a later write by someone else makes that read stale. */
+function noteSeen(st, me, files) {
+  if (!files.length) return;
+  if (!st._locked) return st.locked(() => noteSeen(st, me, files));
+  const a = st.getAgent(me); if (!a) return;
+  a.seen = a.seen || {};
+  for (const f of files) a.seen[f] = NOW();
+  st.saveAgent(a);
+}
+function recordWrite(st, me, rel) { noteEdit(st, me, rel); noteSeen(st, me, [rel]); st.log({ agent: me, type: 'write', path: rel }); }
+/** The first write by another agent to one of `files` since this agent last read that file, or null. */
+function lastWriteSinceRead(st, me, files) {
+  const a = st.getAgent(me), seen = (a && a.seen) || {};
+  if (!files.some(f => seen[f])) return null;
+  return st.readLog(0).events.find(e => e.type === 'write' && e.agent !== me && files.includes(e.path) && seen[e.path] && e.ts > seen[e.path]) || null;
+}
 function gitStaged(root) {
   try { return cp.execFileSync('git', ['diff', '--cached', '--name-only'], { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).split('\n').filter(Boolean); } catch { return []; }
 }
@@ -404,7 +467,7 @@ function activeEditors(st, rel, me, present) {
   for (const a of Object.values(present)) {
     if (a.id === me) continue;
     const holds = c && c.agent === a.id && c.modified && st.claimValid(c, present);
-    const inTurn = a.edited && a.edited[rel] && a.edited[rel] > (a.turn_ended || 0);
+    const inTurn = a.edited && a.edited[rel] && a.edited[rel] > Math.max(a.turn_ended || 0, a.released?.[rel] || 0) && NOW() - a.edited[rel] < IDLE_MS;
     if (holds || inTurn) out.push(a);
   }
   return out;
@@ -424,7 +487,7 @@ const commands = {
       const settingsPath = flags.settings ? path.resolve(flags.settings) : path.join(root, '.claude', 'settings.json');
       const cmd = flags.command || hookCommand();
       const res = installHooks(settingsPath, cmd);
-      writeJSONAtomic(path.join(st.dir, 'config.json'), { ...readJSON(path.join(st.dir, 'config.json'), {}), cmd, mode: flags.mode === 'strict' ? 'strict' : 'advisory' });
+      writeJSONAtomic(path.join(st.dir, 'config.json'), { ...readJSON(path.join(st.dir, 'config.json'), {}), cmd, mode: flags.mode === 'strict' ? 'strict' : 'advisory', ...(flags.brief === 'full' ? { brief: 'full' } : {}) });
       done.push(`${res} hooks in ${path.relative(process.cwd(), settingsPath)} (command: ${cmd} hook <event>)`);
     }
     if (!flags['no-skill']) {
@@ -469,7 +532,7 @@ const commands = {
     const deadline = NOW() + (parseInt(flags.timeout, 10) || 180) * 1000;
     const lines = [];
     for (const f of files) {
-      let r = st.tryClaim(f, me, { steal: !!flags.steal });
+      let r = st.tryClaim(f, me, { steal: !!flags.steal, modified: !!flags.modified });
       if (!r.ok && flags.wait) {
         process.stderr.write(`mom: waiting for ${f} (held by ${r.owner ? label(r.owner, me) : '?'})…\n`);
         const meRec = ensureAgent(st, me, { waiting_for: f });
@@ -477,7 +540,7 @@ const commands = {
         while (!r.ok && NOW() < deadline) {
           const dl = detectDeadlock(st, me, r.claim);
           if (dl && iYield(meRec, dl.holder)) { deadlocked = dl; break; }
-          sleepMs(1500); r = st.tryClaim(f, me);
+          sleepMs(1500); r = st.tryClaim(f, me, { modified: !!flags.modified });
         }
         ensureAgent(st, me, { waiting_for: null });
         if (deadlocked) {
@@ -496,14 +559,20 @@ const commands = {
         if (editors.length) process.stderr.write(`mom: ${f} has in-progress edits by ${editors.map(a => label(a, me)).join(', ')}; waiting for their turn to end…\n`);
         ensureAgent(st, me, { waiting_for: f });
         while (editors.length && NOW() < deadline) {
-          // mutual wait (they are waiting on something too): nobody is editing, so go ahead
+          // Mutual wait: return blocked so the caller can release and retry.
           if (editors.some(a => a.waiting_for)) break;
           sleepMs(1500); editors = activeEditors(st, f, me, st.gc());
         }
         ensureAgent(st, me, { waiting_for: null });
-        if (editors.length) lines.push(`${f}: ${editors.map(a => label(a, me)).join(', ')} ${editors.some(a => a.waiting_for) ? 'is waiting too, so nobody is editing it now — go ahead, but' : 'still has edits in progress (timed out); if you continue,'} re-read it and run the tests before committing.`);
+        if (editors.length) {
+          if (r.fresh) st.release(f, me);
+          lines.push(`BLOCKED ${f}: another worker still has edits in progress; release other files and retry later.`);
+          process.exitCode = 3;
+          continue;
+        }
       }
       if (r.ok) {
+        if (flags.modified) noteEdit(st, me, f);
         const handed = st.readLog(0).events.some(e => e.type === 'handoff' && e.agent !== me && (e.modified || []).includes(f));
         lines.push(`claimed ${f}${handed ? ' — another agent edited this file earlier; re-read it before editing' : ''}`);
       } else {
@@ -513,13 +582,24 @@ const commands = {
     }
     out(lines.join('\n'));
   },
+  begin(st, args) {
+    args.flags.modified = true;
+    return commands.claim(st, args);
+  },
   wait(st, args) { args.flags.wait = true; return commands.claim(st, args); },
   release(st, { flags, pos }) {
     const me = needSelf(st, flags);
-    const files = flags.all ? st.claims().filter(c => c.agent === me).map(c => c.path) : pos.map(f => st.rel(f)).filter(Boolean);
-    if (!files.length) die('usage: mom release <files...> | --all');
+    const files = flags.all ? [...new Set([...st.claims().filter(c => c.agent === me).map(c => c.path), ...myEdits(st, me)])] : pos.map(f => st.rel(f)).filter(Boolean);
+    if (!files.length && !flags.all) die('usage: mom release <files...> | --all');
     const released = [], modified = [];
     for (const f of files) { const c = st.release(f, me); if (c) { released.push(f); if (c.modified) modified.push(f); } }
+    const a = st.getAgent(me);
+    a.released ||= {};
+    for (const f of files) {
+      if (a.edited?.[f] && !released.includes(f) && a.edited[f] > (a.released[f] || 0)) { released.push(f); modified.push(f); }
+      a.released[f] = NOW();
+    }
+    st.saveAgent(a);
     if (released.length) st.log({ agent: me, type: 'handoff', released, modified });
     out(released.length ? `released ${released.join(' ')}` : 'nothing to release');
   },
@@ -544,10 +624,12 @@ const commands = {
     out(renderInbox(st, me) || 'no updates from other agents.');
   },
   mine(st, { flags }) {
-    // Files you have edited this session: the right argument to `git add`.
+    // Registered filenames are not hunk ownership or an isolated Git index.
     const me = needSelf(st, flags);
     const files = myEdits(st, me);
-    out(files.length ? files.join('\n') : '');
+    if (flags.json) out(JSON.stringify(files));
+    else if (flags.null) process.stdout.write(files.map(f => f + '\0').join(''));
+    else out(files.length ? files.join('\n') : '');
     if (!files.length) process.stderr.write('mom: you have not edited any files yet this session.\n');
   },
   log(st, { flags }) {
@@ -556,13 +638,14 @@ const commands = {
     const { events } = st.readLog(0);
     for (const e of events.slice(-n)) out(`${new Date(e.ts).toISOString()} [${short(e.agent)}] ${e.type}${e.text ? ` ${JSON.stringify(e.text)}` : ''}${e.files ? ' ' + e.files.join(' ') : ''}${e.released ? ' ' + e.released.join(' ') : ''}${e.path ? ' ' + e.path : ''}`);
   },
-  gc(st) { st.ensure(); const p = st.gc(); out(`ok: ${Object.keys(p).length} live agent(s), ${st.claims().length} claim(s)`); },
   leave(st, { flags }) {
     const me = needSelf(st, flags);
     leave(st, me); out(`[${short(me)}] left.`);
   },
   where(st) { out(st.dir || '(not in a repo)'); },
   hook(st, { pos }) { return runHook(st, pos[0]); },
+  'init-codex'(st) { require('./codex').install(st.root, __filename); },
+  'codex-hook'(st) { try { require('./codex').hook(__filename); } catch (e) { die(String(e), 2); } },
   version() { out(VERSION); },
   help() { out(HELP); },
 };
@@ -595,6 +678,7 @@ const HOOK_EVENTS = [
   ['UserPromptSubmit', '', 'prompt', 10],
   ['PreToolUse', 'Edit|Write|MultiEdit|NotebookEdit', 'pre-edit', 10],
   ['PreToolUse', 'Bash', 'pre-bash', 10],
+  ['PreToolUse', 'Read', 'pre-read', 10],
   ['PostToolUse', 'Edit|Write|MultiEdit|NotebookEdit|Bash|Task|Agent', 'post-tool', 10],
   ['Stop', '', 'stop', 10],
   ['SubagentStop', '', 'session-end', 10],
@@ -608,13 +692,12 @@ function installHooks(settingsPath, cmd) {
   for (const [event, matcher, sub, timeout] of HOOK_EVENTS) {
     const list = (settings.hooks[event] = settings.hooks[event] || []);
     const command = `${cmd} hook ${sub}`;
-    const exists = list.some(e => (e.hooks || []).some(h => typeof h.command === 'string' && / hook (session-start|prompt|pre-edit|pre-bash|post-tool|stop|session-end)$/.test(h.command) && h.command.endsWith(` hook ${sub}`)));
+    const exists = list.some(e => (e.hooks || []).some(h => typeof h.command === 'string' && / hook (session-start|prompt|pre-edit|pre-read|pre-bash|post-tool|stop|session-end)$/.test(h.command) && h.command.endsWith(` hook ${sub}`)));
     if (exists) continue;
     const entry = { hooks: [{ type: 'command', command, timeout }] };
     if (matcher) entry.matcher = matcher;
     list.push(entry); added++;
   }
-  writeJSONAtomic(settingsPath, settings);
   fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n');
   return added ? `installed ${added}` : 'already had';
 }
@@ -627,8 +710,10 @@ function hookOut(event, additionalContext) {
   if (!additionalContext) return;
   out(JSON.stringify({ hookSpecificOutput: { hookEventName: event, additionalContext } }));
 }
-const INLINE_WRITE = /(<<\s*['"]?\w+|\b(python3?|node|perl|ruby|php)\b[^|;&]*\s(-e|-c|-)\s|\bopen\([^)]*['"][wa]|writeFile|write_text|\.write\(|fs\.(promises\.)?writeFile)/;
+const INLINE_WRITE = /(<<\s*['"]?\w+|\bopen\([^)]*,\s*(?:mode\s*=\s*)?['"][wa]|writeFile|appendFile|unlinkSync|renameSync|write_text|\.write\(|fs\.(promises\.)?writeFile)/;
 const WRITEY = /(\bsed\s+(-[a-zA-Z]*i|--in-place)|\bperl\s+-[a-zA-Z]*i|>{1,2}\s*(?!&|\/dev\/null)|\btee\b|\bmv\b|\bcp\b|\brm\b|\btruncate\b|\bdd\b|\bpatch\b|\bgit\s+(apply|checkout|restore)\b|\bprettier\b.*--write|\beslint\b.*--fix|\bblack\b|\bruff\b.*(format|--fix)|\bgofmt\s+-w|\brustfmt\b)/;
+// A script that writes a file. A heredoc alone proves nothing: `python3 - <<E` is a common way to read.
+const SCRIPT_WRITE = /\bopen\([^)]*,\s*(?:mode\s*=\s*)?['"][wa]|writeFile|appendFile|renameSync|write_text|\.write\(/;
 const GIT_TREEWIDE = [
   [/\bgit\s+stash\b(?!\s+(list|show))/, 'git stash would hide other agents\' uncommitted edits'],
   [/\bgit\s+(checkout|restore)\s+(--\s+)?\.(\s|$)/, 'tree-wide checkout/restore would discard other agents\' edits'],
@@ -645,6 +730,16 @@ const GIT_TREEWIDE = [
 function onPath(name) {
   try { return !!cp.execFileSync(process.platform === 'win32' ? 'where' : 'which', [name], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim(); } catch { return false; }
 }
+/** Does every git invocation in `cmd` run outside this checkout (leading `cd <dir>`, or `git -C <dir>`)? */
+function targetsOtherTree(st, cmd, cwd) {
+  const unq = x => x.replace(/^["']|["']$/g, '');
+  if ((cmd.match(/(^|[;&|]\s*)cd\s/g) || []).length > 1) return false; // several cds: too clever to judge, stay strict
+  const cdm = /^\s*cd\s+("[^"]+"|'[^']+'|\S+)\s*(&&|;)/.exec(cmd);
+  const base = cdm ? path.resolve(cwd, unq(cdm[1])) : cwd;
+  const gits = [...cmd.matchAll(/\bgit\s+(?:-C\s+("[^"]+"|'[^']+'|\S+)\s+)?/g)];
+  if (!gits.length) return false;
+  return gits.every(m => !st.rel(path.join(m[1] ? path.resolve(base, unq(m[1])) : base, '.x')));
+}
 function runHook(st, event) {
   const input = readStdinJSON();
   if (input.cwd) st = new State(locate(input.cwd));
@@ -654,7 +749,7 @@ function runHook(st, event) {
   st.ensure();
   switch (event) {
     case 'session-start': {
-      ensureAgent(st, me, { pid: hostPidFromAncestors(), cwd: input.cwd || st.root });
+      ensureAgent(st, me, { pid: hostPidFromAncestors() });
       // Make `mom` callable from the agent's shell even when installed only as a plugin: put our bin/ on PATH.
       let cmd = 'mom';
       if (process.env.CLAUDE_ENV_FILE) {
@@ -663,21 +758,17 @@ function runHook(st, event) {
           if (!onPath('mom') && process.platform !== 'win32') fs.appendFileSync(process.env.CLAUDE_ENV_FILE, `export PATH=${JSON.stringify(path.dirname(fs.realpathSync(__filename)))}:"$PATH"\n`);
         } catch {}
       } else if (!onPath('mom')) cmd = `node ${fs.realpathSync(__filename)}`;
-      if (!st.cfg.cmd || st.cfg.cmd !== cmd) st.saveCfg({ cmd });
+      if (st.cfg.cmd !== cmd) st.saveCfg({ cmd });
+      if (!st.fullBrief) return; // silent by default: mom only speaks once agents touch the same files
       const others = st.liveAgents().filter(a => a.id !== me);
-      if (!others.length) return; // zero token cost when working alone
-      out(BRIEF(others.length, st.cmd, st.mode) + '\n\n' + renderStatus(st, me));
+      if (others.length) out(BRIEF(others.length, st.cmd, st.mode) + '\n\n' + renderStatus(st, me));
       return;
     }
     case 'prompt': {
       ensureAgent(st, me); st.renewAll(me);
-      const others = st.liveAgents().filter(a => a.id !== me);
-      const inbox = renderInbox(st, me);
-      if (!others.length && !inbox) return;
-      const parts = [];
-      if (inbox) parts.push(inbox);
-      if (others.length) parts.push(renderStatus(st, me, { compact: true }));
-      out(parts.join('\n'));
+      const parts = [renderInbox(st, me)];
+      if (st.fullBrief && st.liveAgents().some(a => a.id !== me)) parts.push(renderStatus(st, me, { compact: true }));
+      out(parts.filter(Boolean).join('\n'));
       return;
     }
     case 'pre-edit': {
@@ -687,20 +778,20 @@ function runHook(st, event) {
       if (!p) return;
       const rel = st.rel(p);
       if (!rel || rel.startsWith('.mom/')) return;
-      const r = st.tryClaim(rel, me, { modified: true });
-      if (r.ok) { noteEdit(st, me, rel); return; }
+      const r = st.tryClaim(rel, me, { modified: true, observed: true });
+      if (r.ok) { recordWrite(st, me, rel); return; }
       const owner = r.owner;
       const c = r.claim || {};
-      const wholeFile = input.tool_name === 'Write' && fs.existsSync(path.join(st.root, rel));
+      const wholeFile = input.tool_name === 'Write';
       if (st.mode !== 'strict' && !wholeFile) {
         // advisory: allow the surgical edit, warn once per file, and tell the holder afterwards.
         const a = st.getAgent(me) || {};
         a.overlaps = a.overlaps || {};
         const first = !a.overlaps[rel];
         a.overlaps[rel] = NOW(); st.saveAgent(a);
-        noteEdit(st, me, rel);
+        recordWrite(st, me, rel);
         st.log({ agent: me, type: 'overlap', path: rel, holder: c.agent });
-        if (first) hookOut('PreToolUse', `mom: heads-up — ${rel} is also being edited right now by ${owner ? label(owner, me) : '[' + short(c.agent) + ']'}. Keep this edit small and local, don't reformat or rewrite the file, and re-Read it before further edits (its contents may change under you).`);
+        if (first) hookOut('PreToolUse', `mom: heads-up — ${rel} is also being edited right now by ${owner ? label(owner, me) : '[' + short(c.agent) + ']'}. Keep this edit small and local, don't reformat or rewrite the file, and re-Read it before further edits (its contents may change under you).${!Object.keys(a.overlaps).some(k => k !== rel) ? ' ' + COLLIDE_TIP(st.cmd) : ''}`);
         return;
       }
       st.log({ agent: me, type: 'blocked', path: rel, holder: c.agent });
@@ -711,19 +802,49 @@ function runHook(st, event) {
       process.stderr.write(msg + '\n');
       process.exit(2);
     }
+    case 'pre-read': {
+      ensureAgent(st, me);
+      const rel = st.rel(String((input.tool_input || {}).file_path || ''));
+      if (rel) noteSeen(st, me, [rel]);
+      return;
+    }
     case 'pre-bash': {
       ensureAgent(st, me); st.renewAll(me);
       const raw = String((input.tool_input || {}).command || '');
       // `$(mom mine)` inside a git command stands for this agent's own files; a command that *is* a mom call is ours.
       const cmd = raw.replace(/\$\(\s*(?:node\s+\S*mom(?:\.js)?|mom)\s+mine\s*\)/g, 'MOM_MINE');
       if (!cmd.trim() || (/^\s*(?:cd\s+\S+\s*(?:;|&&)\s*)?(?:node\s+\S*mom(?:\.js)?|mom)\s/.test(cmd) && !/[;&|]\s*(?:git|sed|mv|cp|rm|tee|python3?|node|perl)\b/.test(cmd))) return;
-      const others = st.liveAgents().filter(a => a.id !== me);
+      // Compare resolved paths, not substrings: `test/cli.test.js` must not match someone's `fixture/test/cli.test.js`.
+      let cwd = input.cwd || st.root;
+      const cdm = /^\s*cd\s+("[^"]+"|'[^']+'|\S+)\s*(&&|;)/.exec(cmd);
+      if (cdm) cwd = path.resolve(cwd, cdm[1].replace(/^["']|["']$/g, ''));
+      const named = new Set(cmd.split(/[\s'"`;&|<>()=,]+/).filter(t => t && /[\w.]/.test(t) && !t.startsWith('-'))
+        .map(t => st.rel(path.resolve(cwd, t.replace(/^\.\//, '')))).filter(Boolean));
+      const files = [...named].filter(f => { try { return fs.statSync(path.join(st.root, f)).isFile(); } catch { return false; } });
+      const writes = WRITEY.test(cmd) || SCRIPT_WRITE.test(cmd) ? files : [];
+      // Shell writes skip the Edit tool's stale-file check, so make the same check here. It needs no live holder: the agent that changed the file may have finished already.
+      const changed = lastWriteSinceRead(st, me, writes);
+      if (changed) {
+        st.log({ agent: me, type: 'blocked', kind: 'stale', path: changed.path, holder: changed.agent });
+        process.stderr.write(`mom: BLOCKED — ${changed.path} was changed by another agent [${short(changed.agent)}] after you last read it, so this command could overwrite their edit. Nothing was written. Read the file again, then redo your change against its current text.\n`);
+        process.exit(2);
+      }
+      noteSeen(st, me, files);
+      for (const f of writes) recordWrite(st, me, f);
+      // Only agents with files in play can be affected by this command.
+      const claimed = new Set(st.claims().map(c => c.agent));
+      const others = st.liveAgents().filter(a => a.id !== me && (claimed.has(a.id) || Object.keys(a.edited || {}).length));
       if (!others.length) return;
+      // A command aimed at another repository (`cd /elsewhere && git add -A`, `git -C /elsewhere ...`) is not ours to police.
+      if (targetsOtherTree(st, cmd, input.cwd || st.root)) return;
+      // `git -C dir -c k=v stash` is still `git stash`: drop git's global options before matching
+      const gitCmd = cmd.replace(/\bgit((?:\s+-[Cc]\s+("[^"]+"|'[^']+'|\S+))+)/g, 'git');
       for (const [re, why] of GIT_TREEWIDE) {
-        if (re.test(cmd)) {
+        if (re.test(gitCmd)) {
           const mine = myEdits(st, me);
           const fix = /\bgit\s+(add|commit)\b/.test(cmd) && mine.length ? ` Your files this session: ${mine.join(' ')}. Do: \`git add ${mine.join(' ')} && git commit -m "..."\` (or \`git add $(${st.cmd} mine)\`).` : '';
-          process.stderr.write(`mom: BLOCKED — ${others.length} other agent${others.length === 1 ? ' is' : 's are'} working in this tree; ${why}.${fix}\n`);
+          st.log({ agent: me, type: 'blocked', kind: 'git' });
+          process.stderr.write(`mom: BLOCKED — ${others.length} other agent${others.length === 1 ? ' is' : 's are'} working on files in this tree; ${why}.${fix}\n`);
           process.exit(2);
         }
       }
@@ -758,22 +879,15 @@ function runHook(st, event) {
           }
           return;
         }
-        const theirs = {};
-        for (const a of others) for (const f of Object.keys(a.edited || {})) (theirs[f] = theirs[f] || []).push(a);
-        const shared = staged.filter(f => theirs[f]);
-        if (shared.length && !a.commit_warned) {
-          a.commit_warned = 'released'; st.saveAgent(a);
-          const who = [...new Set(shared.flatMap(f => theirs[f]))].map(x => label(x, me)).join(', ');
-          hookOut('PreToolUse', `mom: heads-up — ${shared.join(' ')} ${shared.length === 1 ? 'was' : 'were'} also edited this session by ${who} (not right now). Your commit will include their changes to ${shared.length === 1 ? 'it' : 'them'}; that is fine if the tests are green. \`${st.cmd} mine\` lists the files you edited.`);
-        }
         return;
       }
       if (WRITEY.test(cmd) || INLINE_WRITE.test(cmd)) {
         const present = st.gc();
         const theirs = st.claims().filter(c => c.agent !== me && present[c.agent]);
-        const hit = theirs.find(c => cmd.includes(c.path) || cmd.includes(path.basename(c.path)));
+        const hit = theirs.find(c => named.has(c.path));
         if (hit) {
           const owner = present[hit.agent];
+          st.log({ agent: me, type: 'blocked', kind: 'shell', path: hit.path, holder: hit.agent });
           process.stderr.write(`mom: BLOCKED — this command looks like it writes ${hit.path}, which is held by ${label(owner, me)}. Use the Edit tool (so ownership is tracked), do other work first, or \`${st.cmd} wait ${hit.path}\`.\n`);
           process.exit(2);
         }
@@ -782,8 +896,10 @@ function runHook(st, event) {
     }
     case 'post-tool': {
       ensureAgent(st, me);
+      const parts = [];
       const inbox = renderInbox(st, me);
-      if (inbox) hookOut('PostToolUse', inbox);
+      if (inbox) parts.push(inbox);
+      if (parts.length) hookOut('PostToolUse', parts.join('\n'));
       return;
     }
     case 'stop': {
@@ -813,23 +929,26 @@ git checkout with no further setup; state lives in ~/.mom/. Or per repo: \`mom i
 .claude/settings.json, skill), which other tools (Codex, Cursor, humans) can share.
 
 Agent protocol:
+  mom init-codex                 install Codex project hooks (review in /hooks)
   mom plan "<goal>" [files...]   announce what you're doing; reserve files
   mom status                     who is here, who holds what, recent notes
   mom note "<interface change>"  broadcast something others must know
-  mom mine                       files you edited this session  (git add $(mom mine))
+  mom begin <files...> [--wait]  claim and mark files as being edited (hookless agents)
+  mom mine [--json|--null]         files registered for editing, not hunk ownership
   mom claim <files...>           reserve files (hooks do this for Edit/Write automatically)
   mom wait <file> [--timeout S]  block until a file is free, then claim it
   mom release <files...>|--all   hand files back (hooks do this at end of turn)
   mom who <file>                 who holds a file
   mom inbox                      updates from other agents since you last looked
   mom log [--n N]                raw event log
-  mom gc                         drop dead agents / expired claims
   mom leave                      deregister yourself
   mom where                      where this checkout's state lives
-Hooks:  mom hook <session-start|prompt|pre-edit|pre-bash|post-tool|stop|session-end>
+Hooks:  mom hook <session-start|prompt|pre-edit|pre-read|pre-bash|post-tool|stop|session-end>
 Modes:  mom init --mode advisory (default) | strict      (or MOM_MODE=...)
+        mom init --brief full (opt-in: brief the whole protocol up front; MOM_BRIEF=full)
 Env:    MOM_AGENT (identity), MOM_ROOT (repo root), MOM_HOME (state root, default ~/.mom),
-        MOM_TTL_SEC (reservation TTL, default 900), MOM_DISABLE=1 (hooks do nothing)
+        MOM_TTL_SEC (reservation TTL, default 900), MOM_IDLE_SEC (an edited file stops counting as mid-edit after this
+        many seconds without edits by its holder, default 90; claims taken with \`mom begin\` are held until release), MOM_BRIEF=full, MOM_DISABLE=1 (hooks do nothing)
 `;
 
 // ---------------------------------------------------------------- main

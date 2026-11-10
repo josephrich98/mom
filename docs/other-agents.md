@@ -1,26 +1,73 @@
-# Using mom outside Claude Code
+# Codex and other agents
 
-Claude Code gets enforcement for free through hooks. Other agents can participate cooperatively through the CLI (`npm i -g mom-cli`); the claims they take are honoured by the Claude Code hooks, and vice versa. All tools on one machine share state automatically: it is keyed by the checkout's path under `~/.mom/` (or lives in `<repo>/.mom/` after `mom init`).
+## Codex native hooks
 
-## Codex CLI / Cursor / Aider / anything with a shell
+From the checkout run:
 
-Add this to `AGENTS.md` (or `.cursorrules`, or your system prompt):
-
-```
-This repo uses mom to coordinate concurrent agents.
-- Before your first edit: `mom plan "<goal>" <files>`
-- Before editing any file not in your plan: `mom claim <file>` (exit 3 = held by someone else; do other work or `mom wait <file>`)
-- After changing a shared interface: `mom note "<what changed>"`
-- Commit only your own files: `git add $(mom mine) && git commit`. Never add -A / commit -a / stash / reset / checkout . while `mom status` shows other agents.
-- When finished: `mom release --all`
+```sh
+mom init-codex
 ```
 
-Set `MOM_AGENT=<unique id>` in that agent's environment so the CLI knows who it is. If unset, mom tries `CLAUDE_CODE_SESSION_ID`, then matches the parent process against registered agents. (`mom mine` only knows about files claimed through `mom claim`/`mom plan` for tools without hooks.)
+This merges mom handlers into `.codex/hooks.json`, preserving unrelated hooks.
+Trust the project, review and trust the hooks using Codex `/hooks`, then start new sessions. The installed
+commands point to this installation of Node and mom; rerun after moving either.
+Do not commit machine-specific hook paths for other users to run unchanged.
 
-## Codex hooks
+The adapter handles Codex's `tool_input.command` patch format, including every
+file in a multi-file patch and both paths of a rename. Add/delete operations are
+treated as destructive; updates use the configured advisory/strict policy.
+`MOM_MODE=strict` blocks all patch edits to held files. Advisory permits overlapping
+patch updates with warnings; it does not guarantee semantic compatibility.
 
-Codex supports lifecycle hooks similar to Claude Code's; wire `mom hook pre-edit` / `pre-bash` / `stop` to the equivalent events. Contributions welcome: see `HOOK_EVENTS` in `bin/mom.js` for the stdin fields each handler reads (`session_id`, `cwd`, `tool_input.file_path` or `tool_input.command`).
+Session/turn hooks deliver notes and release claims. Identity uses the worker's
+transcript path when supplied, falling back to session/agent IDs. Start/prompt
+context gives the exact `--as` identity for CLI commands; use it rather than an
+inherited `MOM_AGENT` shared by multiple workers. Environments which omit both a
+unique transcript path and worker ID cannot distinguish subagents; use separate
+sessions or explicit identities there.
 
-## Humans
+Shell detection is heuristic, not a security boundary. Before shell/script edits,
+use `mom begin --as <identity> <files>` to register them. Arbitrary scripts, MCP
+writers, symlink aliases and external editors can bypass detection. Supported
+native patch edits are registered automatically, conservatively before execution;
+a failed patch can therefore remain in `mom mine` until the session ends.
 
-You are an agent too. `MOM_AGENT=me mom plan "fixing CI" .github/workflows/ci.yml` keeps the bots out of your file.
+State defaults to `~/.mom`. For a sandbox that only permits checkout writes, first
+run `mom init --no-hooks --no-skill` to keep state in the git-ignored `.mom/` folder.
+The adapter requires a local Node runtime. Remote/cloud hook support varies.
+See [Codex hook contracts and trust](https://learn.chatgpt.com/docs/hooks).
+
+## Hookless Codex / Cursor / Aider / humans
+
+Give each worker a unique persistent `MOM_AGENT` value, or pass `--as <id>` on every
+command. Add this protocol to that worker's instructions:
+
+```text
+- Before reading for an edit, run mom begin <files>. Exit 3 means held: do other
+  work or mom begin --wait <file>, then re-read before editing.
+- begin conservatively records intended edits and holds them until release or
+  owner death. claim is an expiring reservation and does not count as an edit.
+- After interface changes: mom note "<what changed>".
+- Poll mom inbox between work units; notes aren't pushed without hooks.
+- Release promptly after a coherent change: mom release <files>.
+- At completion: mom release --all; mom leave.
+```
+
+`mom mine --json` and `mom mine --null` safely represent unusual filenames.
+It lists files registered for editing, not a verified diff or hunk authorship.
+Never assume `git add $(mom mine)` commits only your work: filenames can contain
+spaces, other workers can edit the same file, and the index is shared. Prefer one
+designated committer after workers release files and the integrated tests pass.
+Review the entire staged diff, including files staged by other sessions. Use
+worktrees when independent commits are required.
+
+## Recovery
+
+Claims expire or disappear with their owner as before. Claim mutations now use a
+short-lived `mutation.lock` directory to serialize replacement, renewal, release
+and garbage collection. A crash inside that critical section deliberately fails
+closed: commands time out after five seconds instead of stealing the mutex.
+Stop all mom users before removing a stranded `mutation.lock` under `mom where`.
+Do not mix old and new mom versions in one checkout: older versions ignore it.
+
+When Codex runs through a persistent app-server daemon, process liveness alone cannot detect a vanished individual session. Stop/SessionEnd hooks are the normal cleanup path; inspect and release stale claims if a daemon-backed session disappears without those events.

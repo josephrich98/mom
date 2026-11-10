@@ -1,0 +1,10 @@
+{
+  "name": "shop-fixture",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Order-processing library and CLI used as a benchmark fixture",
+  "main": "src/index.js",
+  "bin": { "shop": "src/cli.js" },
+  "engines": { "node": ">=18" },
+  "scripts": { "test": "node --test test/*.test.js" }
+}
