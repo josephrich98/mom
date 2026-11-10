@@ -32,7 +32,33 @@ Conditions: `baseline` (no mom) · `mom-advisory` (the default install) · `mom-
 
 The long/commit/slow/haiku prompts are in `tasks-long.json` / `tasks-commit.json`; `tasks-six.json` splits the same work six ways. All agents are told that other agents are working in the checkout.
 
-## Results v0.5 (2026-11-06, n = 10 per cell)
+## Results v0.5.1 (2026-11-10, n = 10 per cell)
+
+Same fixtures, harness and definitions as v0.5 below, run on a Claude subscription login (`--login`) because the API key had no credit. Every row is 10 valid trials. Baselines (`v3-long`, `v4-haiku`, `v4-slow`) and the mom rows were measured hours apart on the same day, and baselines drift by day (fast-suite baseline: 30.7 turns on 11-06, 36.0 on 11-10).
+
+| Scenario | Metric | baseline | v0.5 as committed (`v3`/`v4`) | v0.5.1 (`v6b`) |
+|---|---|---|---|---|
+| Fast suite | Bad runs | 0/10 | 0/10 | 0/10 |
+| | Turns, cost | 36.0, $0.64 | **55.9**, $0.73 | 34.3, $0.60 |
+| | mom blocks per trial | | 4.9 | 0.8 |
+| 15 s suite | Bad runs | 1/10 | 2/10 | 1/10 (missed one README line) |
+| | Quit red (of 30 agents) | 4 | 8 | 4 |
+| | Turns, cost, p90 | 29.5, $0.55, 195 s | 44.7, $0.71, 201 s | 37.1, $0.67, 201 s |
+| Haiku | Bad runs | 0/10 | 1/10 | 0/10 |
+| | Turns, cost, timeouts | 100, $0.10, 0 | 117, $0.11, 0 | 117, $0.11, 0 |
+
+`--brief full` on Haiku (`v4-haiku`): 0/10 bad, 102 turns, $0.09.
+
+What changed between the columns (all in `bin/mom.js`, covered by unit tests):
+1. **The stale-write check covers only whole-file overwrites.** v0.5 blocked any shell write to a file another agent had changed since this one read it. Most blocked commands were `sed -i` and `s=open(p).read(); ...; open(p,'w').write(s)` scripts, which apply to the current text and cannot lose the other agent's change. `=>` and `a > b` inside heredoc bodies were also read as redirects. Replayed against v3's 47 stale blocks, 43 would now pass, and the 4 left are real overwrites.
+2. **In advisory mode, in-place shell edits to a held file get a heads-up, like an `Edit`.** Blocking them with "use the Edit tool" set off a cascade: agents switched to Edit (5–7 Edit calls per trial against ~0 in baseline), their Edits claimed files, and those claims blocked others. Fixes 1 and 2 together (`v5`) brought the fast suite to 34.5 turns and $0.61.
+3. **A blind overwrite counts from the agent's start.** One `v5` trial lost a feature: an agent that had read `src/store.js` only through `cat src/*.js` (a glob, so no recorded read) later ran `cat > src/store.js` with its old version. With no recorded read, staleness now counts from when the agent started. `v6b` measures this version.
+
+Not replicated: v0.5's Haiku result (4/11 bad without mom on 11-06) was 0/10 on 11-10. The idle-claim fix did remove the Haiku hangs (4 timeouts → 0, p90 1205 s → ~300 s).
+
+Mixed Claude + Codex (`v3-shop-mixed`): 1 valid baseline trial (45/45). The mom trial was invalid when a Codex agent hit the ChatGPT plan's usage limit, the same as on 11-06.
+
+## Results v0.5 (2026-11-06, n = 10 per cell; superseded by v0.5.1 above)
 
 mom at sha256 `652c5531…` (lean brief; before the idle-claim change below). Sonnet 5.5 unless noted. "Bad run" = the final shared tree fails any acceptance check (lost work, a broken build, or an unfinished feature). "Quit red" counts agents (3 per trial; 8 for `shop`) whose final message says the suite is failing. Raw rows: `results-n10-<tag>.jsonl`.
 

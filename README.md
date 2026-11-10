@@ -4,7 +4,7 @@
 
 mom keeps parallel AI coding agents (Claude Code sessions, Codex, Cursor, you) from destroying each other's work in the same repo. It is a zero-dependency CLI that installs as a Claude Code plugin. There is no supervising agent, no LLM call, and nothing written into your repo.
 
-It is a safety net, not a speed-up. In the common case it stays out of the way: in our benchmark, coordinated Sonnet agents cost the same as uncoordinated ones (same turns, +2% dollars). It speaks up only when agents actually collide, and it pays off in the runs that would otherwise go wrong. Those come from weaker models, whole-file rewrites, and tree-wide git commands in a shared checkout.
+It is a safety net, not a speed-up. In the common case it stays out of the way: in our benchmark, coordinated Sonnet agents cost about the same as uncoordinated ones (34 vs 36 turns, $0.60 vs $0.64). It speaks up only when agents actually collide: a whole-file overwrite of something another agent just changed, or a tree-wide git command in a shared checkout.
 
 ![two Claude Code sessions in one checkout; the second one is told what the first holds, is stopped from rewriting a file mid-edit, and is told exactly which files to commit](assets/demo.svg)
 
@@ -23,7 +23,7 @@ CLI for other agents and humans: `npm i -g mom-cli`. Per-repo opt-in without the
 
 From the benchmark transcripts (headless agents, one checkout, overlapping tasks, no coordination):
 
-- **They rewrite each other's files.** Uncoordinated Haiku 5.5 agents left a broken final tree in 4 of 11 trials. The worst passed 44% of acceptance checks, and in one `todo add` no longer worked. With mom's full brief: 0 of 10.
+- **They rewrite each other's files.** An agent that read the code once runs `cat > src/store.js <<EOF` with its own version and wipes out another agent's feature. In one 2026-11-06 batch, uncoordinated Haiku 5.5 agents left a broken tree in 4 of 11 trials (worst: 44% of checks). That rate did not replicate on 2026-11-10 (0 of 10), so treat it as how bad it can get, not how often.
 - **They sweep up each other's half-finished work.** Told to commit when done, every uncoordinated Sonnet trial ran `git add -A` at least once. One agent ran `git update-ref` and `git reset` in the shared tree. mom blocks these deterministically and prints the exact `git add <your files>` to run instead.
 - **They give up and blame each other.** In an 8-agent run on a 17-file repo, a fifth of Sonnet agents stopped with the suite red: *"3 tests fail… All four failures come from another agent's shipping change."* The last agent standing cleaned up. (mom doesn't fix this one yet; see [Numbers](#numbers).)
 - **They invent their own coordination.** Uncoordinated Haiku agents wrote `sleep 60; md5sum src/*.js` and `until grep -q priorityOption src/cli.js; do sleep 1; done` to wait for each other.
@@ -66,22 +66,23 @@ n = 10 trials per cell, conditions interleaved, Sonnet 5.5 unless noted. A **bad
 
 | Scenario | | without mom | with mom |
 |---|---|---|---|
-| **Fast suite**, 3 agents (the common case) | Bad runs | 1/10 | 0/10 |
-| | Cost, turns | $0.47, 30.7 | $0.48, 30.7 |
-| **15 s suite**, 3 agents | Bad runs | 0/10 | 0/10 |
-| | Wall-clock p90 | 200 s | 169 s |
-| **8 agents**, 17-file repo | Bad runs | 1/10 | 1/10 |
+| **Fast suite**, 3 agents (the common case) | Bad runs | 0/10 | 0/10 |
+| | Turns, cost | 36.0, $0.64 | 34.3, $0.60 |
+| **15 s suite**, 3 agents | Bad runs | 1/10 | 1/10 |
+| | Cost, wall-clock p90 | $0.55, 195 s | $0.67, 201 s |
+| **Haiku 5.5**, 3 agents | Bad runs | 0/10 | 0/10 |
+| | Turns, cost | 100, $0.10 | 117, $0.11 |
+| **8 agents**, 17-file repo (v0.5, 2026-11-06) | Bad runs | 1/10 | 1/10 |
 | | Cost | $1.08 | $1.18 |
-| **Haiku 5.5**, 3 agents | Bad runs | **4/11** (worst 44%) | **0/10** with `--brief full`; 1/10 with the lean brief |
-| | Wall-clock p90 | 276 s | 698 s (full brief) |
+
+v0.5.1, 2026-11-10, except the 8-agent row. Baselines and mom runs were measured hours apart on the same day.
 
 What this says, honestly:
 
-- **mom is now close to free when nothing goes wrong.** The v0.4 up-front protocol brief cost +23% and 2.25× the turns in the common case. The default lean brief costs the same as no mom.
-- **Strong models rarely need saving, even eight at a time.** Sonnet's bad-run rate is about 1 in 10 with or without mom. On the 8-agent repo mom cost about 9% more for no measurable gain.
-- **The rescue is for weaker models.** Haiku without coordination broke the tree in 4 of 11 trials. The full brief prevented all of them, at about 2.5× the p90 wall-clock. The lean default prevented most, but some agents hung waiting on each other's claims. That led to the idle-claim fix below, whose benchmark validation was cut short; see [bench/README.md](bench/README.md#v05-idle-claims-partial-n--27). For whole-file-rewriting models, use `mom init --brief full`.
-- **Some earlier claims did not replicate.** At n = 3, mom seemed to stop agents abandoning a slow suite (3 of 9 → 0 of 9). At n = 10 it is 4 of 30 vs 2 of 30. Blocking `git add -A`/stash/reset is deterministic and doesn't depend on sampling.
-- **Caveats.** Two small synthetic repos, tasks that finish in minutes, agents told up front that others are present. Mixed Claude + Codex runs are not measured yet. Benchmark PRs on real repos are the most useful contribution.
+- **mom is close to free when nothing goes wrong.** In the common case it now matches no-mom on turns and cost. Getting here took three fixes in v0.5.1: the shell stale-write check had been blocking `sed -i` and read-then-write scripts, which work on the file's current text and can't lose anyone's change. That cost +55% turns (56 vs 36). On the slow suite and Haiku it still costs 15–20% more.
+- **Strong models rarely need saving.** Bad-run rates are about 0–1 in 10 with or without mom, for Sonnet and, on 2026-11-10, for Haiku. mom's measurable value is in the rare run that goes wrong: one v0.5.1 trial lost a feature to a blind `cat >` overwrite, which mom now blocks.
+- **Some earlier claims did not replicate.** "mom rescues Haiku" (4 of 11 bad without it, 2026-11-06) was 0 of 10 on 2026-11-10. At n = 3, mom seemed to stop agents abandoning a slow suite; at n = 10 it doesn't. Blocking `git add -A`/stash/reset is deterministic and doesn't depend on sampling.
+- **Caveats.** Two small synthetic repos, tasks that finish in minutes. Mixed Claude + Codex runs are not measured: the Codex plan's quota ran out after one 8-agent trial pair, twice. Benchmark PRs on real repos are the most useful contribution.
 
 ## How it works
 
@@ -90,7 +91,8 @@ Every file an agent edits is **claimed** for that agent until its turn ends. Cla
 | Failure mode | What mom does |
 |---|---|
 | Both agents see a file as free at the same moment | Check-and-claim is a single atomic `open(O_EXCL)`. |
-| An agent rewrites a file someone else is mid-edit on | Whole-file `Write`, `cat >`, `sed -i`, heredocs and inline scripts aimed at a held file are blocked. Surgical `Edit`s go through with a one-time heads-up to both sides. |
+| An agent rewrites a file someone else is mid-edit on | Whole-file overwrites of a held file (`Write`, `cat >`, `tee`, `cp`, scripts that write without reading) are blocked. In-place changes (`Edit`, `sed -i`, scripts that read the file and then write it) go through with a one-time heads-up to both sides, because they apply to the file's current text. |
+| An agent overwrites a file with an old copy | A shell overwrite of a file another agent changed since this agent last read it (or since it started, if it never read it) is blocked until it re-reads. |
 | An agent commits other agents' half-finished work | `git add -A`, `commit -a`, `stash`, `checkout .`, `reset`, `update-ref` are blocked while another agent has files in play, with the exact `git add <your files>` to run instead. A plain commit that includes a file someone is mid-edit on gets a heads-up naming them. |
 | An agent crashes holding files | Claims die with their owner's process; reservations expire after 15 idle minutes. A state mutex serializes claim replacement and garbage collection. |
 | Two files depend on a changing interface | `mom note "<what changed>"` reaches agents that share a file with the sender after their next tool call. |
@@ -100,7 +102,7 @@ Every file an agent edits is **claimed** for that agent until its turn ends. Cla
 
 Two modes. **Advisory** (default) blocks only the destructive moves above and warns on the rest. **Strict** (`MOM_MODE=strict` or `mom init --mode strict`) also blocks every edit to a held file and every commit that includes a file under edit; it is for agents that rewrite whole files or don't re-read.
 
-**Silent unless files overlap.** An agent working alone, or alongside agents on different files, hears nothing from mom. It speaks only on a collision: an overlapping edit, a block, or a note or handoff that concerns a file the agent has touched. Tree-wide git commands count as overlap when another agent has files in play, because they sweep up those files too. `mom init --brief full` (or `MOM_BRIEF=full`) opts in to the opposite: the whole protocol at session start whenever others are present, and status with every prompt. It costs about 2× the turns and is meant for weaker models.
+**Silent unless files overlap.** An agent working alone, or alongside agents on different files, hears nothing from mom. It speaks only on a collision: an overlapping edit, a block, or a note or handoff that concerns a file the agent has touched. Tree-wide git commands count as overlap when another agent has files in play, because they sweep up those files too. `mom init --brief full` (or `MOM_BRIEF=full`) opts in to the opposite: the whole protocol at session start whenever others are present, and status with every prompt. It costs up to 2× the turns. It was meant for weaker models, but in the 2026-11-10 runs Haiku did as well without it.
 
 A claim with edits blocks others only while its holder keeps editing the file: after 90 s without edits (`MOM_IDLE_SEC`) it goes cold, and the next taker is told to re-read. Without this, agents in a headless run (where one turn is the whole run) waited on each other until they timed out. Claims taken with `mom begin` (hookless agents) are held until released.
 

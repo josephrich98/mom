@@ -1,6 +1,6 @@
 {
   "name": "mom",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Run several AI coding agents in one checkout without them overwriting each other. Atomic file claims, interface-change notes, and a block on git commands that would sweep up another agent's half-done work. Zero dependencies, zero tokens when you work alone.",
   "author": { "name": "Joseph Rich", "url": "https://github.com/josephrich98" },
   "homepage": "https://github.com/josephrich98/mom",

@@ -19,7 +19,7 @@ No heavy prompting. No supervising LLM. An agent working alone must pay nothing.
 | The up-front file list is wrong | Every Edit/Write passes through a PreToolUse hook that claims the file on the spot (or blocks). |
 | Two files depend on a changing interface | `mom note "<what changed>"` reaches agents sharing a file with the sender, which receive it as `additionalContext` after their next tool call. |
 | An agent read a file that another agent then changed | Releasing an edited file logs a *handoff*. Everyone else is told "re-read X before editing" exactly once. `mom wait` says the same thing when it acquires a file that was handed off. |
-| Shell commands bypass the Edit tool | PreToolUse on Bash blocks `sed -i`/`>`/`mv`… aimed at a file someone else holds, and blocks tree-wide git operations (`stash`, `checkout .`, `reset`, `add -A`, `commit -a`, `update-ref`) while another agent has files in play. Reads are never blocked. |
+| Shell commands bypass the Edit tool | PreToolUse on Bash blocks whole-file overwrites (`>`, `tee`, `cp`/`mv`, `rm`, scripts that write without reading) of a file someone else holds or changed since this agent read it. In advisory mode, in-place edits (`sed -i`, read-then-write scripts) to a held file get the same heads-up as an `Edit`: blocking them in v0.5 pushed agents to the Edit tool, whose claims blocked others in turn (+55% turns). It also blocks tree-wide git operations (`stash`, `checkout .`, `reset`, `add -A`, `commit -a`, `update-ref`) while another agent has files in play. Reads are never blocked. |
 | A commit sweeps up someone else's half-finished edits | Every file an agent edits is remembered for the session (`mom mine`). `git add -A` / `commit -a` are blocked with the exact `git add <your files>` to run instead. A plain `git commit` whose index holds a file another agent is mid-edit on (claimed with edits, or edited during their current turn) gets a one-time heads-up naming the file and the agent; strict mode blocks it. We tried blocking in advisory mode too: agents did the right thing (`mom wait`, twice), timed out because in a shared tree "their turn" can be their whole run, and gave up without committing, for no fewer broken commits than baseline. So: warn, don't block. |
 | Idle agents hog files | The Stop hook releases everything at the end of a turn. Claims come back automatically on the next edit. |
 
@@ -38,7 +38,7 @@ mom now says nothing at session start or on prompts. An agent alone, or alongsid
 | Event | What the agent hears |
 |---|---|
 | its edit overlaps a file another agent is mid-edit on | one heads-up per file; the first one also says how to `mom note` an interface change |
-| it tries to destroy someone's work (whole-file Write over a held file, `sed -i`/`cat >` on it) | BLOCKED, with the exact alternative |
+| it tries to destroy someone's work (whole-file Write or `cat >` over a held file, or over a file changed since it last read it) | BLOCKED, with the exact alternative |
 | it runs a tree-wide git command while another agent has files in play | BLOCKED, with the exact alternative |
 | it stages a file another agent is mid-edit on | one heads-up |
 | an agent sharing a file posts a `mom note`, or releases a file this agent has touched | one line |

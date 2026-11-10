@@ -20,7 +20,7 @@ const os = require('os');
 const cp = require('child_process');
 const crypto = require('crypto');
 
-const VERSION = '0.5.0';
+const VERSION = '0.5.1';
 const MOM_HOME = process.env.MOM_HOME || path.join(os.homedir(), '.mom');
 const TTL_SEC = parseInt(process.env.MOM_TTL_SEC || '', 10) || 900; // reservation TTL
 const TTL_MS = TTL_SEC * 1000;
