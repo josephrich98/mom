@@ -451,11 +451,14 @@ function noteSeen(st, me, files) {
   st.saveAgent(a);
 }
 function recordWrite(st, me, rel) { noteEdit(st, me, rel); noteSeen(st, me, [rel]); st.log({ agent: me, type: 'write', path: rel }); }
-/** The first write by another agent to one of `files` since this agent last read that file, or null. */
+/** The first write by another agent to one of `files` since this agent last read that file, or null. An agent with no
+ *  recorded read (it may have read through a glob, or not at all) counts from when it started: overwriting a file that
+ *  someone changed since then, without reading it again, is exactly how their work gets lost. */
 function lastWriteSinceRead(st, me, files) {
-  const a = st.getAgent(me), seen = (a && a.seen) || {};
-  if (!files.some(f => seen[f])) return null;
-  return st.readLog(0).events.find(e => e.type === 'write' && e.agent !== me && files.includes(e.path) && seen[e.path] && e.ts > seen[e.path]) || null;
+  const a = st.getAgent(me); if (!a || !files.length) return null;
+  const seen = a.seen || {}, since = f => seen[f] || a.started || 0;
+  const e = st.readLog(0).events.find(e => e.type === 'write' && e.agent !== me && files.includes(e.path) && e.ts > since(e.path));
+  return e ? { ...e, unread: !seen[e.path] } : null;
 }
 function gitStaged(root) {
   try { return cp.execFileSync('git', ['diff', '--cached', '--name-only'], { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).split('\n').filter(Boolean); } catch { return []; }
@@ -714,6 +717,29 @@ const INLINE_WRITE = /(<<\s*['"]?\w+|\bopen\([^)]*,\s*(?:mode\s*=\s*)?['"][wa]|w
 const WRITEY = /(\bsed\s+(-[a-zA-Z]*i|--in-place)|\bperl\s+-[a-zA-Z]*i|>{1,2}\s*(?!&|\/dev\/null)|\btee\b|\bmv\b|\bcp\b|\brm\b|\btruncate\b|\bdd\b|\bpatch\b|\bgit\s+(apply|checkout|restore)\b|\bprettier\b.*--write|\beslint\b.*--fix|\bblack\b|\bruff\b.*(format|--fix)|\bgofmt\s+-w|\brustfmt\b)/;
 // A script that writes a file. A heredoc alone proves nothing: `python3 - <<E` is a common way to read.
 const SCRIPT_WRITE = /\bopen\([^)]*,\s*(?:mode\s*=\s*)?['"][wa]|writeFile|appendFile|renameSync|write_text|\.write\(/;
+const SCRIPT_READ = /\.read\(|readFileSync|readFile\(|read_text|readlines/;
+/** Which files would `cmd` replace wholesale with text the agent wrote earlier (`cat > f`, `tee f`, `cp x f`, a script
+ *  that writes without reading)? Returns a list of path tokens, or 'all' when it cannot tell. In-place edits (`sed -i`,
+ *  `perl -i`, a script that reads the file then writes it, `>>`) apply to the file's current text, so they cannot
+ *  discard another agent's change and need no stale-read check. Heredoc bodies and quoted strings are not shell:
+ *  `=>` or `a > b` inside them is not a redirect. */
+function overwriteTargets(cmd) {
+  // interpreter scripts (`python3 - <<E ... E`, `node -e "..."`), each judged on its own; a `cat > f <<E` body is data
+  const scripts = [];
+  for (const m of cmd.matchAll(/^([^\n]*<<-?\s*['"]?(\w+)['"]?[^\n]*)\n([\s\S]*?)\n\s*\2[ \t]*(?=\n|$)/gm)) if (/\b(python3?|node|perl|ruby|bun|deno)\b/.test(m[1])) scripts.push(m[3]);
+  for (const m of cmd.matchAll(/\b(?:python3?|node|perl|ruby)\s+(?:-\w+\s+)*-[ce]\s+("(?:[^"\\]|\\.)*"|'[^']*')/g)) scripts.push(m[1]);
+  if (scripts.some(s => SCRIPT_WRITE.test(s) && !SCRIPT_READ.test(s))) return 'all';
+  const shell = cmd.replace(/(<<-?\s*['"]?(\w+)['"]?[^\n]*)\n[\s\S]*?\n\s*\2[ \t]*(?=\n|$)/g, '$1')
+    .replace(/(>\s*)?('[^']*'|"[^"]*")/g, (m, redir) => redir ? m : "''")
+    .replace(/\bsed\s+(-[a-zA-Z]*i|--in-place)\S*/g, ' ').replace(/\bperl\s+-[a-zA-Z]*i\S*/g, ' ').replace(/>>/g, ' ');
+  const out = [];
+  for (const m of shell.matchAll(/(?:^|[^&\d])>\s*(?!&|\/dev\/null)("[^"]+"|'[^']+'|[^\s;&|<>()]+)/g)) out.push(m[1]);
+  for (const m of shell.matchAll(/\btee\s+((?:-\S+\s+)*)([^\s;&|<>()]+)/g)) if (!/-\w*a|--append/.test(m[1])) out.push(m[2]);
+  for (const m of shell.matchAll(/\b(?:cp|mv)\s+[^;&|\n]*?([^\s;&|<>()]+)\s*(?=$|[;&|\n])/g)) out.push(m[1]);
+  for (const m of shell.matchAll(/\brm\s+([^;&|\n]*)/g)) out.push(...m[1].split(/\s+/).filter(t => t && !t.startsWith('-')));
+  if (/\btruncate\b|\bdd\b|\bpatch\b|\bgit\s+(apply|checkout)\b|\bgit\s+restore\b(?![^;&|\n]*--staged)|\bprettier\b.*--write|\beslint\b.*--fix|\bblack\b|\bruff\b.*(format|--fix)|\bgofmt\s+-w|\brustfmt\b/.test(shell)) return 'all';
+  return out.map(t => t.replace(/^["']|["']$/g, ''));
+}
 const GIT_TREEWIDE = [
   [/\bgit\s+stash\b(?!\s+(list|show))/, 'git stash would hide other agents\' uncommitted edits'],
   [/\bgit\s+(checkout|restore)\s+(--\s+)?\.(\s|$)/, 'tree-wide checkout/restore would discard other agents\' edits'],
@@ -822,11 +848,13 @@ function runHook(st, event) {
         .map(t => st.rel(path.resolve(cwd, t.replace(/^\.\//, '')))).filter(Boolean));
       const files = [...named].filter(f => { try { return fs.statSync(path.join(st.root, f)).isFile(); } catch { return false; } });
       const writes = WRITEY.test(cmd) || SCRIPT_WRITE.test(cmd) ? files : [];
-      // Shell writes skip the Edit tool's stale-file check, so make the same check here. It needs no live holder: the agent that changed the file may have finished already.
-      const changed = lastWriteSinceRead(st, me, writes);
+      // Shell overwrites skip the Edit tool's stale-file check, so make the same check here. It needs no live holder: the agent that changed the file may have finished already.
+      const ow = writes.length ? overwriteTargets(cmd) : [];
+      const owFiles = ow === 'all' ? writes : ow.map(t => st.rel(path.resolve(cwd, t.replace(/^\.\//, '')))).filter(f => writes.includes(f));
+      const changed = lastWriteSinceRead(st, me, owFiles);
       if (changed) {
         st.log({ agent: me, type: 'blocked', kind: 'stale', path: changed.path, holder: changed.agent });
-        process.stderr.write(`mom: BLOCKED — ${changed.path} was changed by another agent [${short(changed.agent)}] after you last read it, so this command could overwrite their edit. Nothing was written. Read the file again, then redo your change against its current text.\n`);
+        process.stderr.write(`mom: BLOCKED — ${changed.path} was changed by another agent [${short(changed.agent)}] ${changed.unread ? 'since you started, and you have not read it since' : 'after you last read it'}, so this command could overwrite their edit. Nothing was written. Read the file again, then redo your change against its current text.\n`);
         process.exit(2);
       }
       noteSeen(st, me, files);
@@ -887,6 +915,18 @@ function runHook(st, event) {
         const hit = theirs.find(c => named.has(c.path));
         if (hit) {
           const owner = present[hit.agent];
+          // Advisory: an in-place shell edit (sed -i, a read-modify-write script) to a held file is the shell form of a
+          // surgical Edit, so it gets the same treatment: allowed, with one heads-up per file. Overwrites stay blocked.
+          const ow = overwriteTargets(cmd);
+          const overwrites = ow === 'all' || ow.some(t => st.rel(path.resolve(cwd, t.replace(/^\.\//, ''))) === hit.path);
+          if (st.mode !== 'strict' && !overwrites) {
+            const a = st.getAgent(me); a.overlaps = a.overlaps || {};
+            const first = !a.overlaps[hit.path];
+            a.overlaps[hit.path] = NOW(); st.saveAgent(a);
+            st.log({ agent: me, type: 'overlap', path: hit.path, holder: hit.agent });
+            if (first) hookOut('PreToolUse', `mom: heads-up — ${hit.path} is also being edited right now by ${label(owner, me)}. Keep this edit small and local, and re-read the file before further edits (its contents may change under you).`);
+            return;
+          }
           st.log({ agent: me, type: 'blocked', kind: 'shell', path: hit.path, holder: hit.agent });
           process.stderr.write(`mom: BLOCKED — this command looks like it writes ${hit.path}, which is held by ${label(owner, me)}. Use the Edit tool (so ownership is tracked), do other work first, or \`${st.cmd} wait ${hit.path}\`.\n`);
           process.exit(2);

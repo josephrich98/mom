@@ -440,9 +440,37 @@ test('stale-write guard: an agent that never read the file is not blocked, and E
   assert.equal(bash('A', "cat a.js").code, 0);
   run(d, ['hook', 'pre-edit'], { stdin: hookIn('B', { cwd: d, tool_name: 'Edit', tool_input: { file_path: 'a.js' } }), env });
   run(d, ['hook', 'stop'], { stdin: hookIn('B', { cwd: d }), env });
-  assert.equal(bash('C', "sed -i 's/1/2/' a.js").code, 0, 'C never read a.js');
-  const r = bash('A', "sed -i 's/1/2/' a.js");
+  assert.equal(bash('C', "cat > a.js <<'E'\nx\nE").code, 0, 'C never read a.js');
+  const r = bash('A', "cat > a.js <<'E'\nx\nE");
   assert.equal(r.code, 2); assert.match(r.err, /changed by another agent/);
+});
+
+test('stale-write guard: in-place edits apply to current text and pass; whole-content overwrites are stopped', () => {
+  const d = mk();
+  const env = { MOM_MODE: 'advisory' };
+  const bash = (who, command) => run(d, ['hook', 'pre-bash'], { stdin: hookIn(who, { cwd: d, tool_name: 'Bash', tool_input: { command } }), env });
+  assert.equal(bash('A', 'cat a.js').code, 0);
+  run(d, ['hook', 'pre-edit'], { stdin: hookIn('B', { cwd: d, tool_name: 'Edit', tool_input: { file_path: 'a.js' } }), env });
+  run(d, ['hook', 'stop'], { stdin: hookIn('B', { cwd: d }), env });
+  // a stale A, every time: nothing below reads a.js first except where it is the point
+  const stale = () => {
+    bash('A', 'cat a.js');
+    run(d, ['hook', 'pre-edit'], { stdin: hookIn('B', { cwd: d, tool_name: 'Edit', tool_input: { file_path: 'a.js' } }), env });
+    run(d, ['hook', 'stop'], { stdin: hookIn('B', { cwd: d }), env });
+  };
+  for (const ok of [
+    "sed -i 's/1/2/' a.js",
+    "perl -pi -e 's/1/2/' a.js",
+    "python3 - <<'E'\np='a.js'; s=open(p).read()\ns=s.replace('(x) => 1', '(x) => x > 0')\nopen(p,'w').write(s)\nE",
+    "node -e \"const fs=require('fs');fs.writeFileSync('a.js', fs.readFileSync('a.js','utf8').replace('a','b'))\"",
+    "echo 'x' >> a.js",
+  ]) { stale(); assert.equal(bash('A', ok).code, 0, ok); }
+  for (const bad of [
+    "cat > a.js <<'E'\nconst f = (x) => x;\nE",
+    "python3 - <<'E'\nopen('a.js','w').write('x')\nE",
+    'cp b.js a.js',
+    'echo x | tee a.js',
+  ]) { stale(); assert.equal(bash('A', bad).code, 2, bad); }
 });
 
 test('agent host detection judges the executable, not mentions of mom elsewhere on the command line', () => {
@@ -490,4 +518,45 @@ test('an observed edit claim goes cold after MOM_IDLE_SEC without edits; a begin
   assert.equal(edit('B', 'a.js').code, 0, 'cold after the idle window: B may take it');
   assert.match(run(d, ['inbox'], { as: 'B', env }).out, /released edited file: a\.js/, 'the idle handoff tells B to re-read');
   assert.equal(edit('B', 'b.js').code, 2, 'a hookless begin claim is held until release');
+});
+
+test('stale-write guard: only the files a command overwrites are checked', () => {
+  const d = mk();
+  const env = { MOM_MODE: 'advisory' };
+  const bash = (who, command) => run(d, ['hook', 'pre-bash'], { stdin: hookIn(who, { cwd: d, tool_name: 'Bash', tool_input: { command } }), env });
+  assert.equal(bash('A', 'cat a.js b.js').code, 0);
+  run(d, ['hook', 'pre-edit'], { stdin: hookIn('B', { cwd: d, tool_name: 'Edit', tool_input: { file_path: 'a.js' } }), env });
+  run(d, ['hook', 'stop'], { stdin: hookIn('B', { cwd: d }), env });
+  // a.js is stale for A: editing it in place while overwriting b.js, or deleting an unrelated temp file, is fine
+  assert.equal(bash('A', "python3 - <<'E'\np='a.js'; s=open(p).read(); open(p,'w').write(s.replace('1','2'))\nE\ncat > b.js <<'E'\nfs.writeFileSync('x', 'y')\nE").code, 0);
+  assert.equal(bash('A', "sed -i 's/1/2/' a.js; node a.js rm 9; rm -f /tmp/mom-nothing.json").code, 0);
+  run(d, ['hook', 'pre-edit'], { stdin: hookIn('B', { cwd: d, tool_name: 'Edit', tool_input: { file_path: 'a.js' } }), env });
+  run(d, ['hook', 'stop'], { stdin: hookIn('B', { cwd: d }), env });
+  assert.equal(bash('A', 'rm a.js').code, 2, 'deleting the stale file is an overwrite');
+});
+
+test('advisory: an in-place shell edit to a held file is allowed with a heads-up; an overwrite is blocked; strict blocks both', () => {
+  for (const mode of ['advisory', 'strict']) {
+    const d = mk();
+    const env = { MOM_MODE: mode };
+    run(d, ['hook', 'pre-edit'], { stdin: hookIn('B', { cwd: d, tool_name: 'Edit', tool_input: { file_path: 'a.js' } }), env });
+    const bash = command => run(d, ['hook', 'pre-bash'], { stdin: hookIn('A', { cwd: d, tool_name: 'Bash', tool_input: { command } }), env });
+    const sed = bash("sed -i 's/1/2/' a.js");
+    if (mode === 'advisory') { assert.equal(sed.code, 0); assert.match(sed.out, /heads-up/); assert.equal(bash("sed -i 's/2/3/' a.js").out, '', 'warned once per file'); }
+    else assert.equal(sed.code, 2);
+    assert.equal(bash("cat > a.js <<'E'\nx\nE").code, 2, mode + ': overwrite of a held file');
+  }
+});
+
+test('stale-write guard: an agent that read a file only through a glob still cannot overwrite a newer version blind', () => {
+  const d = mk();
+  const env = { MOM_MODE: 'advisory' };
+  const bash = (who, command) => run(d, ['hook', 'pre-bash'], { stdin: hookIn(who, { cwd: d, tool_name: 'Bash', tool_input: { command } }), env });
+  assert.equal(bash('A', 'cat *.js').code, 0); // A starts and reads via a glob: no per-file read recorded
+  run(d, ['hook', 'pre-edit'], { stdin: hookIn('B', { cwd: d, tool_name: 'Edit', tool_input: { file_path: 'a.js' } }), env });
+  run(d, ['hook', 'stop'], { stdin: hookIn('B', { cwd: d }), env });
+  const r = bash('A', "cat > a.js <<'E'\nold\nE");
+  assert.equal(r.code, 2); assert.match(r.err, /have not read it since/);
+  assert.equal(bash('A', "sed -i 's/1/2/' a.js").code, 0, 'an in-place edit is still fine');
+  assert.equal(bash('A', "cat > a.js <<'E'\nnew\nE").code, 0, 'the sed touched (and so saw) a.js');
 });
