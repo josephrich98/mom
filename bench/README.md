@@ -56,7 +56,20 @@ What changed between the columns (all in `bin/mom.js`, covered by unit tests):
 
 Not replicated: v0.5's Haiku result (4/11 bad without mom on 11-06) was 0/10 on 11-10. The idle-claim fix did remove the Haiku hangs (4 timeouts → 0, p90 1205 s → ~300 s).
 
-Mixed Claude + Codex (`v3-shop-mixed`): 1 valid baseline trial (45/45). The mom trial was invalid when a Codex agent hit the ChatGPT plan's usage limit, the same as on 11-06.
+Mixed Claude + Codex (`v3-shop-mixed`, 4 Codex agents per trial): 1 valid baseline trial (45/45). The mom trial was invalid when a Codex agent hit the ChatGPT plan's usage limit, the same as on 11-06.
+
+### Mixed Claude + Codex on the fast suite (`mixed-long`, v0.5.1, n = 5 / 4)
+
+To fit within the Codex plan's quota: the 3-agent `long` fixture, with `rename-due` run by Codex (`--codex half`) and the other two by Claude Sonnet 5.5. The run was stopped automatically when Codex hit its usage limit on trial 10, which leaves 5 baseline and 4 mom trials.
+
+| | baseline | mom (lean, default) |
+|---|---|---|
+| Bad runs | 0/5 | 0/4 |
+| Quit red (of 2 Claude agents per trial) | 0 | 1 |
+| Claude turns, Claude cost | 19.0, $0.35 | 20.8, $0.36 |
+| Wall-clock mean, p90 | 166 s, 182 s | 179 s, 197 s |
+
+mom saw all three agents in every mom trial. The Codex agent joined under its hook-supplied `--as` identity, and its 20 or so writes per trial were tracked like the Claude agents' writes, so cross-tool coordination works end to end. With 4–5 trials and no bad runs on either side, this shows mom works with Codex and adds little cost there. It does not show any benefit.
 
 ## Results v0.5 (2026-11-06, n = 10 per cell; superseded by v0.5.1 above)
 

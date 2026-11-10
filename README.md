@@ -82,7 +82,7 @@ What this says, honestly:
 - **mom is close to free when nothing goes wrong.** In the common case it now matches no-mom on turns and cost. Getting here took three fixes in v0.5.1: the shell stale-write check had been blocking `sed -i` and read-then-write scripts, which work on the file's current text and can't lose anyone's change. That cost +55% turns (56 vs 36). On the slow suite and Haiku it still costs 15–20% more.
 - **Strong models rarely need saving.** Bad-run rates are about 0–1 in 10 with or without mom, for Sonnet and, on 2026-11-10, for Haiku. mom's measurable value is in the rare run that goes wrong: one v0.5.1 trial lost a feature to a blind `cat >` overwrite, which mom now blocks.
 - **Some earlier claims did not replicate.** "mom rescues Haiku" (4 of 11 bad without it, 2026-11-06) was 0 of 10 on 2026-11-10. At n = 3, mom seemed to stop agents abandoning a slow suite; at n = 10 it doesn't. Blocking `git add -A`/stash/reset is deterministic and doesn't depend on sampling.
-- **Caveats.** Two small synthetic repos, tasks that finish in minutes. Mixed Claude + Codex runs are not measured: the Codex plan's quota ran out after one 8-agent trial pair, twice. Benchmark PRs on real repos are the most useful contribution.
+- **Caveats.** Two small synthetic repos, tasks that finish in minutes. Mixed Claude + Codex is measured only on the small repo with one Codex agent (n = 5 vs 4): 0 bad runs either way, Claude cost $0.35 vs $0.36, and mom tracked the Codex agent's writes in every trial. The 8-agent mixed runs could not run: the Codex plan's quota ran out after one trial pair, twice. Benchmark PRs on real repos are the most useful contribution.
 
 ## How it works
 
