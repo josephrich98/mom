@@ -39,6 +39,9 @@ const SECTIONS = [
     { label: '3 at a time', base: ['hl-paper-c3', 'baseline'], mom: ['hl-paper-c3', 'mom-advisory'], k: true, build: true },
     { label: 'All 6 at once', base: [['v8-paper-c6', 'v9-paper-c6'], 'baseline'], mom: [['v8-paper-c6', 'v9-paper-c6'], 'mom-advisory'], k: true },
   ] },
+  { title: 'Math: problem set + answer key, 6 agents, 1 task each', groups: [
+    { label: 'All 6 at once', base: ['math2-c6', 'baseline'], mom: ['math2-c6', 'mom-advisory'], k: true },
+  ] },
 ];
 
 const METRICS = {
@@ -100,7 +103,7 @@ function chart(key) {
   grid += `<line class="axis" x1="${LX}" x2="${LX}" y1="${top}" y2="${bottom}"/>`;
   const H = bottom + 54;
   const legend = `<rect class="s1" x="16" y="58" width="12" height="12" rx="2"/><text class="t2" x="34" y="68.5" font-size="12">Without mom</text>`
-    + `<rect class="s2" x="130" y="58" width="12" height="12" rx="2"/><text class="t2" x="148" y="68.5" font-size="12">With mom (v0.5.1 default)</text>`
+    + `<rect class="s2" x="130" y="58" width="12" height="12" rx="2"/><text class="t2" x="148" y="68.5" font-size="12">With mom (default settings)</text>`
     + `<text class="t3" x="340" y="68.5" font-size="12">Bar = mean, dots = individual runs</text>`;
   const foot = `<text class="t3" x="16" y="${H - 14}" font-size="11">† ran an earlier build of mom (2026-11-09). n = runs without / with mom. All agents are headless and share one git checkout.</text>`;
   return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" role="img" aria-label="${esc(M.title)}">${STYLE}`

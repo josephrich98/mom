@@ -32,6 +32,36 @@ Conditions: `baseline` (no mom) · `mom-advisory` (the default install) · `mom-
 
 The long/commit/slow/haiku prompts are in `tasks-long.json` / `tasks-commit.json`; `tasks-six.json` splits the same work six ways. All agents are told that other agents are working in the checkout.
 
+## Math: problem set + answer key, 6 agents at once (2026-11-11, v0.6, n = 20)
+
+`bench/fixture-math` is a Markdown problem set (`problems.md`, 3 worked examples with deliberate mistakes, 6 unsolved problems) plus a JSON answer key (`answers.json`). The six agents in `bench/tasks-math.json`:
+- `solve-a`, `solve-b` and `solve-c` solve two problems each: ∫₀^π x sin x dx, a 3×3 linear system, 2×2 eigenvalues, a non-consecutive-subset count, a conditional dice probability, and exponential decay.
+- `examples` fixes the three worked examples (a product-rule slip, an arithmetic error, a determinant sign).
+- `hints` adds a hint under each problem.
+- `logistics` moves the due date and adds a formula sheet.
+
+`bench/check-math.js` has 35 checks. The untouched fixture scores 10/35 and a correct hand solution 35/35. Agents are not told others are present, all start at once (`--stagger 0`), and baseline and mom ran counterbalanced in the same batch.
+
+```
+node bench/run.js --conditions baseline,mom-advisory --trials 20 --parallel 2 --login --stagger 0 \
+  --fixture bench/fixture-math --tasks bench/tasks-math.json --check bench/check-math.js --tag math2-c6
+```
+
+| `math2-c6` | Without mom | With mom (v0.6) |
+|---|---|---|
+| Fully correct runs | 13/20 | **17/20** |
+| Checks passed (mean) | 82.1% | **99.3%** |
+| Worst run | 13/35 | 33/35 |
+| Tokens (output + uncached input) | 91k | 96k |
+| Wall-clock, median | 25 s | 25 s |
+| Turns, mean | 32.5 | 37.4 |
+
+**Without mom.** Six runs lost most of the set (13–18/35). In each of them, one agent (`examples` in five, `logistics` in one) ran `git checkout [--] problems.md answers.json` partway through. It saw solutions it hadn't written and, told to leave everything else as it was, reverted them. One copied both files to `/tmp/unexpected_backup` first. The seventh imperfect run is a model error: `examples` judged Example 1's faulty product rule correct and only "fixed" the decimal.
+
+**With mom.** No agent ran a checkout, and mom logged 178 overlap notices and 24 `restored` merges across the 20 runs. mom blocks `git checkout -- <file>` while another agent holds the file or has changed it since the caller's last read, and allows it once the other agent has finished. Two runs lost one agent's edit: two Python read-modify-write scripts wrote `problems.md` within 0.1 s of each other, and the after-write merge didn't catch it (run 7: `solve-c`'s two solutions; run 15: the Example 3 fix). The third imperfect run is the same Example 1 model error.
+
+**Superseded first batch (`math-c6`).** Its shared prompt said "Write each solution in place of its placeholder" to every agent, so `examples`, `hints` and `logistics` sometimes solved problems that weren't theirs. That batch scored 11/20 vs 19/20 fully correct. The prompt now limits solution writing to the solver agents. The results file is kept, but not charted.
+
 ## Results v0.6 (2026-11-10): lost-update repair
 
 **Why.** On v0.5.1 the "all at once" writing cell showed no benefit (97.1% vs 96.6%). The transcripts of every bad run, in both conditions, showed the same thing. An agent read `manuscript.md`, then ran a script such as `L=open(p).read().split('\n'); L[4]=<abstract rewritten from what it read earlier>; open(p,'w').write(...)`. The rewrite silently reverted another agent's `sed` (412 → 438, g C m-2 yr-1 → Mg C ha-1 yr-1, "intermittent" → "pulsed"). The script reads the file before writing it, so v0.5.1 treated it as an in-place edit and let it through.

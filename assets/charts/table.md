@@ -10,3 +10,4 @@
 | Writing: one manuscript, 1 agent at a time † | 5 / 5 | 5/5 → 5/5 | 100% → **100%** | 88k → 81k | 121 s → 120 s |
 | Writing: one manuscript, 3 at a time † | 5 / 5 | 3/5 → 3/5 | 95.4% → **96.0%** | 94k → 106k | 56 s → 63 s |
 | Writing: one manuscript, All 6 at once | 20 / 20 | 7/20 → 16/20 | 81.0% → **97.9%** | 112k → 112k | 45 s → 38 s |
+| Math: problem set + answer key, All 6 at once | 20 / 20 | 13/20 → 17/20 | 82.1% → **99.3%** | 91k → 96k | 26 s → 26 s |

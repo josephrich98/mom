@@ -1,0 +1,29 @@
+{
+  "shared_suffix": "\n\nThe problem set is problems.md and the answer key is answers.json, both in the project directory. If your task is to solve problems, write each solution in place of that problem's \"_To be written._\" placeholder, as a short worked derivation that ends with the final answer. In answers.json, record a numeric answer as a JSON number (exact integer, or a decimal to six places) and a list answer as a JSON array of numbers in the order asked. Do only the task described above, and leave every other problem, placeholder and section as it is. When you are done, reply with a short summary of what you changed.",
+  "agents": [
+    {
+      "name": "solve-a",
+      "prompt": "Solve Problems 1 and 2 of the problem set. Record the answers in answers.json under problems.p1 (a number) and problems.p2 (the array [x, y, z])."
+    },
+    {
+      "name": "solve-b",
+      "prompt": "Solve Problems 3 and 4 of the problem set. Record the answers in answers.json under problems.p3 (the eigenvalues as an array in ascending order) and problems.p4 (a number)."
+    },
+    {
+      "name": "solve-c",
+      "prompt": "Solve Problems 5 and 6 of the problem set. Record the answers in answers.json under problems.p5 and problems.p6 (numbers)."
+    },
+    {
+      "name": "examples",
+      "prompt": "The three worked examples at the top of the problem set each contain a mistake. Find and correct each mistake in place, so that each derivation and its final value are right, and record the corrected final values in answers.json under examples.e1 (the value of f'(e)), examples.e2 and examples.e3 (the determinant)."
+    },
+    {
+      "name": "hints",
+      "prompt": "Add a one-sentence hint to each of the six problems, on its own line that starts with \"*Hint:*\", directly below the problem statement and above its Solution. The hint should name the method to use without giving away the answer."
+    },
+    {
+      "name": "logistics",
+      "prompt": "Two edits. (1) The due date has moved from Friday, March 6 to Monday, March 9 (still 5 pm). Update it everywhere it appears. (2) Add a section titled \"## Formula sheet\" just before the Submission section, listing as bullets one standard formula each for integration by parts, Cramer's rule or Gaussian elimination, the characteristic polynomial of a 2x2 matrix, binomial coefficients, conditional probability, and exponential decay."
+    }
+  ]
+}
