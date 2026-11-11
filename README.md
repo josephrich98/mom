@@ -1,10 +1,8 @@
 # mom
 
-**Two agents. One checkout. Somebody has to make them share.**
+**Run several AI coding agents in one checkout without them destroying each other's work.**
 
-mom keeps parallel AI coding agents (Claude Code sessions, Codex, Cursor, you) from destroying each other's work in the same repo. It is a zero-dependency CLI that installs as a Claude Code plugin. There is no supervising agent, no LLM call, and nothing written into your repo.
-
-It is a safety net, not a speed-up. In the common case it stays out of the way: in our benchmark, coordinated Sonnet agents cost about the same as uncoordinated ones (34 vs 36 turns, $0.60 vs $0.64). It speaks up only when agents actually collide: a whole-file overwrite of something another agent just changed, a write that would undo another agent's edit, or a tree-wide git command in a shared checkout. Where that happens a lot, it matters. Eight agents changing one 17-file codebase at once passed 77% of acceptance checks on their own and 99% with mom. Six agents editing one manuscript at once passed 81% on their own and 98% with mom, and six agents working one math problem set and its answer key passed 82% and 99% ([Numbers](#numbers)).
+mom is a Claude Code plugin (plus a small CLI for Codex and other tools). Its hooks see every edit, file read and shell command your agents make, and step in when one agent is about to wipe out another's work. It has no LLM, no daemon, no dependencies, and it writes nothing into your repo. An agent that isn't colliding with anyone never hears from it.
 
 ![two Claude Code sessions in one checkout; the second one is told what the first holds, is stopped from rewriting a file mid-edit, and is told exactly which files to commit](assets/demo.svg)
 
@@ -15,64 +13,41 @@ It is a safety net, not a speed-up. In the common case it stays out of the way: 
 /plugin install mom@mom
 ```
 
-That's it. From the next session, every git checkout you open is covered. No `init`, no settings edits, no `.gitignore` entry: state lives in `~/.mom/`.
+That's it. Starting with your next session, mom covers every git checkout you open. Its state lives in `~/.mom/`. For Codex, Cursor or humans, install the CLI with `npm i -g mom-cli` (see [Works with](#works-with)).
 
-CLI for other agents and humans: `npm i -g mom-cli`. Per-repo opt-in without the plugin: `mom init` (see [docs/other-agents.md](docs/other-agents.md)).
+## What it does
 
-## What breaks without it
+Agents sharing one checkout lose work in four ways. mom has one fix for each:
 
-From the benchmark transcripts (headless agents, one checkout, overlapping tasks, no coordination):
+| How work gets lost | What mom does |
+|---|---|
+| **Whole-file overwrite.** Agent A is partway through editing `store.js`. Agent B writes its own version of the whole file (`Write`, `cat > f`, `cp`, a script that writes without reading), and A's changes are gone. | Every file an agent edits is **claimed** for it. Whole-file writes to a file another agent holds are **blocked**. Small in-place edits (`Edit`, `sed -i`) still go through, and both agents get a one-line heads-up. |
+| **Stale overwrite.** B read a file ten minutes ago, A changed it since, and B writes its old copy back. | A shell overwrite of a file someone else changed since this agent last read it is **blocked** until the agent reads the file again. |
+| **Stale paste.** B's script reads the file and rewrites one paragraph using text B saw earlier, which silently puts back words A had changed in that paragraph. It looks like an in-place edit, so nothing else catches it. | mom keeps a copy of each file as each agent last read it. After a write, it runs a word-level three-way merge. If the write undid someone else's change, mom **puts their change back**, keeps the writer's own change, and tells the writer. |
+| **Tree-wide git.** Told to commit, an agent runs `git add -A` and commits everyone's half-finished work. Or it runs `git stash`, `git checkout .` or `git reset`, which wipe out the other agents' changes. | While another agent has files in play, these are **blocked**, and mom prints the exact `git add <your files>` to run instead. |
 
-- **They rewrite each other's files.** An agent that read the code once runs `cat > src/store.js <<EOF` with its own version and wipes out another agent's feature. In one 2026-11-06 batch, uncoordinated Haiku 5.5 agents left a broken tree in 4 of 11 trials (worst: 44% of checks). That rate did not replicate on 2026-11-10 (0 of 10), so treat it as how bad it can get, not how often. With eight Sonnet agents changing one 17-file repo at once, 2 of 16 uncoordinated runs came out fully correct (77% of checks passed), against 8 of 11 (99%) with mom.
-- **They paste over each other's edits.** An agent reads the manuscript, then a minute later runs a script that replaces the abstract with a shortened version of the text it read. Meanwhile another agent changed 412 plots to 438 in that abstract, and the script silently puts 412 back. It looks like an in-place edit (it reads the file, then writes it), so nothing flags it. With six agents editing one manuscript at once, 11 of 20 uncoordinated runs lost at least one agent's whole task this way.
-- **They sweep up each other's half-finished work.** Told to commit when done, every uncoordinated Sonnet trial ran `git add -A` at least once. One agent ran `git update-ref` and `git reset` in the shared tree. mom blocks these deterministically and prints the exact `git add <your files>` to run instead.
-- **They give up and blame each other.** In an 8-agent run on a 17-file repo, a fifth of Sonnet agents stopped with the suite red: *"3 tests fail… All four failures come from another agent's shipping change."* The last agent standing cleaned up. (mom doesn't fix this one yet; see [Numbers](#numbers).)
-- **They invent their own coordination.** Uncoordinated Haiku agents wrote `sleep 60; md5sum src/*.js` and `until grep -q priorityOption src/cli.js; do sleep 1; done` to wait for each other.
+That's the core. Two smaller things fill in around it: when an agent finishes with a file that others have touched, they're told to re-read it, and `mom note "<what changed>"` lets an agent tell the others that it changed an interface they use.
 
-## What the second agent sees
-
-Nothing, until it touches a file another agent is working on. If it edits a file the other agent is mid-edit on:
-
-```
-mom: heads-up — src/store.js is also being edited right now by [03f0]. Keep this edit small and local, don't reformat or rewrite the file, and re-Read it before further edits. If you change an interface other code calls (signature, field, flag, export), tell the others: `mom note "<what changed>"`.
-```
-
-If it tries to rewrite that file wholesale:
+Here is what an agent sees:
 
 ```
+mom: heads-up — src/store.js is also being edited right now by [03f0]. Keep this edit small and local,
+don't reformat or rewrite the file, and re-Read it before further edits.
+
 mom: BLOCKED — src/store.js is currently held by agent [03f0] (claimed 2m ago, 3 edits so far).
 Rewriting the whole file would discard their edits; use the Edit tool for a surgical change instead.
-```
 
-If it tries `git add -A`:
-
-```
 mom: BLOCKED — 1 other agent is working in this tree; stage only your own files.
 Your files this session: README.md src/format.js. Do: `git add README.md src/format.js && git commit -m "..."`
 ```
 
-If its test run comes back red while another agent is mid-edit, it is told whose files those are, so it doesn't "fix" their half-done work. When another agent releases a file this one touched, it is told to re-read it. These warnings reduce accidental overwrites; advisory edits and arbitrary scripts still depend on cooperation.
+**What it doesn't do.** It's a safety net, not a security boundary: mom recognizes shell writes by pattern, so an unusual script can get past it. It can't catch semantic conflicts either, such as an agent adding new code that uses a name another agent just renamed. And it doesn't make agents faster.
 
-## Codex
+## Results
 
-`mom init-codex` installs native hooks: `apply_patch` edits are claimed like Claude Code edits, and shell commands are screened. The benchmark runner can mix Codex and Claude agents in one checkout (`--codex half`). That measurement is still missing: the ChatGPT plan's usage limit stopped the mixed 8-agent run after one trial. The earlier [Codex pilot](bench/CODEX-RESULTS.md) ran with a host-detection bug, since fixed, that kept Codex claims from holding. See [benchmark methodology](bench/README.md#codex).
-
-## Numbers
-
-Headless agents in one shared git checkout, no worktrees. Every chart compares the same tasks without mom (blue) and with mom's default settings (orange). Bars are means and dots are individual runs. Each run is scored by an acceptance checker that reads the final shared tree. The scenarios:
-
-- **Code, todo CLI:** 3 agents with 2 tasks each (ESM migration, async refactor, a field rename, due dates, priorities, `--json`/`edit`), 32 checks. Agents are told others are present.
-- **Code, shop CLI:** a 17-file order-processing CLI, 8 agents with one task each (a cross-cutting rename, tiers, coupons, loyalty, tax, shipping, …), 45 checks. Agents are *not* told others are present, and they run 1, 3 or all 8 at a time.
-- **Writing:** one 6-section ecology manuscript in Markdown, 6 agents with one edit each (terminology, updated sample sizes, unit conversion, a new result, citation style, abstract), 35 checks. Not told, and run 1, 3 or all 6 at a time.
-- **Math:** one problem set in Markdown plus a JSON answer key, 6 agents at once, 35 checks. Three agents solve two problems each (an integral, a linear system, eigenvalues, a counting problem, a conditional probability, an ODE), one corrects three broken worked examples, one adds hints, and one moves the due date and adds a formula sheet. The checks cover every answer in the key (within tolerance), each written solution reaching its answer, the corrected examples, and 8 sentences no task should touch. Not told.
+Headless agents worked in one shared git checkout on overlapping tasks, with no worktrees. An acceptance checker scored the final tree. Blue bars are runs without mom and orange bars are runs with mom. Bars show means and dots show individual runs.
 
 ![Correctness: share of acceptance checks passed, without and with mom, for each scenario](assets/charts/correctness.svg)
-
-![Tokens per run, without and with mom, for each scenario](assets/charts/tokens.svg)
-
-![Wall-clock per run, without and with mom, for each scenario](assets/charts/time.svg)
-
-![Turns per run in the common case across mom versions: 36.0 without mom, 55.9 for v0.5 as first committed, 34.5 after the in-place-edit fixes, 34.3 for v0.5.1](assets/charts/versions.svg)
 
 | Scenario | Runs (without / with) | Fully correct runs | Checks passed | Tokens | Wall-clock |
 |---|---|---|---|---|---|
@@ -88,90 +63,57 @@ Headless agents in one shared git checkout, no worktrees. Every chart compares t
 | Writing: one manuscript, All 6 at once | 20 / 20 | 7/20 → 16/20 | 81.0% → **97.9%** | 112k → 112k | 45 s → 38 s |
 | Math: problem set + answer key, All 6 at once | 20 / 20 | 13/20 → 17/20 | 82.1% → **99.3%** | 91k → 96k | 26 s → 26 s |
 
-† ran the 2026-11-09 build of mom. The two "all at once" mom rows are v0.6, and the other mom rows are v0.5.1 (v0.6 changes nothing that fires there; see [bench/README.md](bench/README.md#results-v06-2026-11-10-lost-update-repair)). Measured 2026-11-09 to 2026-11-11 with Sonnet 5.5 unless noted. "Sonnet 5.5 + Codex" has one of the three agents run by Codex. Regenerate the charts and this table with `node bench/charts.js`. Full tables, older runs and caveats: [bench/README.md](bench/README.md).
+† ran the 2026-11-09 build of mom. The three "all at once" mom rows are v0.6, and the other mom rows are v0.5.1 (v0.6 changes nothing that fires there). Measured 2026-11-09 to 2026-11-11 with Sonnet 5.5 unless noted. Regenerate the charts and this table with `node bench/charts.js`.
 
-What this says, honestly:
+What the numbers say:
 
-- **mom earns its keep when many agents edit the same files at once without knowing about each other.** With all 8 shop agents running together, uncoordinated runs passed 76.9% of checks (2 of 16 fully correct; worst 22%): features vanished when another agent rewrote the file under them. With mom, 99.2% passed (8 of 11 fully correct, worst 96%), at about 10% more tokens and a median wall-clock of 115 s against 103 s. The mean (157 s) is pulled up by one run in which an agent wrote its own `sleep 20` loop and polled for 8 minutes for another agent's test to go green. The imperfect mom runs each missed a leftover old name from the cross-cutting rename, one of them also with a red suite at the end. When the same 8 tasks ran one or three at a time, both conditions scored 97–100%.
-- **Writing is protected now, too.** Six agents editing one manuscript at once passed 81.0% of checks without mom (7 of 20 runs fully correct) and 97.9% with v0.6 (16 of 20), at the same tokens and 15% less time. In 11 of the 13 imperfect uncoordinated runs, at least one agent's whole task was lost to a stale paste-over. v0.5.1 scored 96.6% vs 97.1% here, because those writes look like in-place edits and it let them through. v0.6 keeps a copy of each file as each agent last read it. When a write puts back words that someone else changed in between, mom merges their change back in (a word-level three-way merge) and tells the writer. The three imperfect mom runs left one old term in the text, and one lost three tasks to a paste-over that mom couldn't repair, because the agent had viewed the file in a way the first v0.6 build didn't record (`cat -A f | head; cat f`). The released build records it, and its 10 runs lost nothing.
-- **Math looks the same.** Six agents on one problem set and answer key passed 82.1% of checks without mom (13 of 20 runs fully correct) and 99.3% with v0.6 (17 of 20), at 5% more tokens and the same 25 s median wall-clock. The six bad uncoordinated runs (13–18 of 35) each lost most of the set, and in all six one agent had run `git checkout -- problems.md answers.json`. It saw changes it hadn't made (the other agents' solutions) and, told to leave everything else as it was, reverted them. One copied the files to `/tmp/unexpected_backup` first. With mom, no agent tried it: mom had already told them others were editing the same files, and it repaired 24 overwrites. mom also blocks that checkout while another agent holds either file or has changed it since the agent last read it. Once the other agent has finished, the checkout goes through. Of the three imperfect mom runs, two lost one agent's edit to scripts that wrote `problems.md` within 0.1 s of each other, a race the after-write repair doesn't see, and in one the agent judged Example 1's faulty product rule to be correct. The model made that same math mistake in 1 of the 20 uncoordinated runs.
-- **Everywhere else, the final tree is about as correct with or without mom.** Sonnet, Haiku and Sonnet + Codex on the 3-agent repo were at or near 100% either way.
-- **Cost is close to neutral.** Tokens ranged from −6% (Sonnet, common case) to +18% (15 s suite), and wall-clock from −9% to +24% (Haiku). mom is a safety net, not a speed-up.
-- **The overhead chart is a warning about mom itself.** v0.5 as first committed blocked harmless in-place shell edits and cost 55% more turns. v0.5.1 is back to baseline. See [bench/README.md](bench/README.md#results-v051-2026-11-10-n--10-per-cell).
-- **Some earlier claims did not replicate.** "mom rescues Haiku" (4 of 11 uncoordinated trees broken on 2026-11-06) was 0 of 10 on 2026-11-10. At n = 3, mom seemed to stop agents abandoning a slow suite; at n = 10 it doesn't. Blocking `git add -A`, stash and reset is deterministic, so it doesn't depend on sampling.
-- **Caveats.** 5–20 runs per bar. The first math batch (`math-c6`, 11/20 vs 19/20 fully correct) is not shown: its shared prompt told every agent to write solutions, so agents solved problems that weren't theirs. Most baseline and mom runs were measured in separate batches, sometimes on different days, and baselines drift by day. The v0.6 runs are the exception: baseline and mom ran side by side in the same batches. The repos are small and synthetic, and the tasks finish in minutes. The Codex runs have one Codex agent, because the plan's quota ran out on the 8-agent mixed runs. Benchmark PRs on real repos are the most useful contribution.
+- **mom matters when many agents edit the same files at once.** With 8 agents on one 17-file codebase, runs without mom passed 77% of checks (2 of 16 fully correct). Features vanished when another agent rewrote a file under them. With mom, runs passed 99%. Six agents on one manuscript went from 81% to 98%: in 11 of 20 runs without mom, a stale paste-over lost an agent's whole task. Six agents on a problem set and answer key went from 82% to 99%. In every bad uncoordinated run, one agent saw edits it hadn't made and reverted them with `git checkout -- <files>`.
+- **Otherwise it stays out of the way.** With 3 agents, or with tasks run one or three at a time, results are about the same with or without mom.
+- **It costs about the same.** Tokens ranged from −6% to +18%, and wall-clock from −9% to +24%.
+- **Caveats.** 5–20 runs per bar. The repos are small and synthetic, and the tasks finish in minutes. Some baselines were measured on different days from their mom runs, except for the v0.6 rows, which ran both arms side by side. Earlier claims that failed to replicate, the scenario details and the token and time charts are in [bench/README.md](bench/README.md). Benchmark runs on real repos are the most useful contribution.
 
 ## How it works
 
-Every file an agent edits is **claimed** for that agent until its turn ends. Claims are one small JSON file each, created with `O_EXCL`, so *checking* whether a file is free and *taking* it is one atomic operation. A short-lived filesystem mutex also serializes stale replacement, renewal and cleanup; see [recovery](docs/other-agents.md#recovery).
+- **Claims.** Each claim is one small JSON file under `~/.mom/repos/<hash of checkout path>/claims/`. It is created with `O_EXCL`, so checking whether a file is free and taking it is a single atomic step. A claim goes away when the agent's turn ends, after 90 s without edits to that file (`MOM_IDLE_SEC`), or when the agent's process dies.
+- **Snapshots.** For the lost-update repair, mom keeps the text of each file as each agent last read it in full (a `Read` with no offset or limit, or a plain `cat f`), plus the text just before that agent's write. Files over 1 MB are skipped. The merge is `bin/merge3.js`, about 70 lines.
+- **Silence.** No hook prints anything unless the agent's action overlaps another agent's files. Everything is plain files: `mom where` prints the directory, and deleting it resets mom.
 
-| Failure mode | What mom does |
-|---|---|
-| Both agents see a file as free at the same moment | Check-and-claim is a single atomic `open(O_EXCL)`. |
-| An agent rewrites a file someone else is mid-edit on | Whole-file overwrites of a held file (`Write`, `cat >`, `tee`, `cp`, scripts that write without reading) are blocked. In-place changes (`Edit`, `sed -i`, scripts that read the file and then write it) go through with a one-time heads-up to both sides, because they apply to the file's current text. |
-| An agent overwrites a file with an old copy | A shell overwrite of a file another agent changed since this agent last read it (or since it started, if it never read it) is blocked until it re-reads. |
-| An agent writes part of a file from an old copy (a script that pastes in text it read earlier) | mom keeps each file as each agent last read it in full. If a write puts back words that another agent has changed since, mom merges their change back in (word-level three-way merge), keeps the writer's own change, and tells the writer. Where both changed the same words, the writer's version stands. |
-| An agent commits other agents' half-finished work | `git add -A`, `commit -a`, `stash`, `checkout .`, `reset`, `update-ref` are blocked while another agent has files in play, with the exact `git add <your files>` to run instead. A plain commit that includes a file someone is mid-edit on gets a heads-up naming them. |
-| An agent crashes holding files | Claims die with their owner's process; reservations expire after 15 idle minutes. A state mutex serializes claim replacement and garbage collection. |
-| Two files depend on a changing interface | `mom note "<what changed>"` reaches agents that share a file with the sender after their next tool call. |
-| An agent read a file that another agent then changed | Releasing an edited file logs a handoff; others are told once to re-read it. |
-| Idle agents hog files | The Stop hook releases everything at end of turn; the next edit re-claims. |
-| Two waiters hold what the other wants | `mom wait` detects the cycle within seconds; the agent that joined later yields. |
+**Modes.** *Advisory* (the default) blocks only the destructive moves above. *Strict* (`MOM_MODE=strict` or `mom init --mode strict`) also blocks any edit to a file another agent holds, and any commit that includes one. Strict mode made agents 2–3× slower in the benchmark, so use it only for agents that rewrite whole files.
 
-Two modes. **Advisory** (default) blocks only the destructive moves above and warns on the rest. **Strict** (`MOM_MODE=strict` or `mom init --mode strict`) also blocks every edit to a held file and every commit that includes a file under edit; it is for agents that rewrite whole files or don't re-read.
-
-**Silent unless files overlap.** An agent working alone, or alongside agents on different files, hears nothing from mom. It speaks only on a collision: an overlapping edit, a block, or a note or handoff that concerns a file the agent has touched. Tree-wide git commands count as overlap when another agent has files in play, because they sweep up those files too. `mom init --brief full` (or `MOM_BRIEF=full`) opts in to the opposite: the whole protocol at session start whenever others are present, and status with every prompt. It costs up to 2× the turns. It was meant for weaker models, but in the 2026-11-10 runs Haiku did as well without it.
-
-A claim with edits blocks others only while its holder keeps editing the file: after 90 s without edits (`MOM_IDLE_SEC`) it goes cold, and the next taker is told to re-read. Without this, agents in a headless run (where one turn is the whole run) waited on each other until they timed out. Claims taken with `mom begin` (hookless agents) are held until released.
+Design history (what was tried and dropped, and why): [docs/design.md](docs/design.md).
 
 ## Commands
 
+Agents rarely need these. The hooks do the work.
+
 ```
-mom status [--json]              who is here, who holds what, recent notes
-mom plan "<goal>" [files...]     announce your work; reserve files
-mom note "<text>"                broadcast an interface change
-mom begin <files...> [--wait]    claim and register hookless edits
-mom mine [--json|--null]          files registered for editing (not hunk ownership)
-mom init-codex                   install project Codex hooks (trust via /hooks)
-mom claim <files...> [--wait]    reserve files (hooks do this automatically for Edit/Write)
-mom wait <file> [--timeout S]    block until a file is free and nobody is mid-edit on it
+mom status [--json]              who is here and who holds what
+mom note "<text>"                tell agents that share your files about an interface change
+mom wait <file> [--timeout S]    block until a file is free (detects circular waits)
 mom release <files...> | --all   hand files back early
+mom mine [--json|--null]         files you edited this session
 mom who <file>                   who holds a file
-mom inbox                        updates from others since you last looked
-mom log                          raw event log
-mom where                        where this checkout's state lives
-mom init [--mode strict] [--brief full]  opt a repo in explicitly: .mom/ in the repo, hooks in .claude/settings.json
+mom begin <files...> [--wait]    claim files by hand (for agents without hooks)
+mom inbox                        updates from others (for agents without hooks)
+mom init                         opt a repo in: state in <repo>/.mom/, hooks in .claude/settings.json
+mom init-codex                   install Codex hooks (then trust them with /hooks)
 ```
 
-Environment: `MOM_AGENT` (identity; Claude Code sessions are detected automatically), `MOM_HOME` (state root, default `~/.mom`), `MOM_ROOT`, `MOM_MODE`, `MOM_BRIEF=full`, `MOM_IDLE_SEC` (default 90), `MOM_TTL_SEC` (default 900), `MOM_DISABLE=1`.
+Run `mom help` for the rest (`plan`, `claim`, `log`, `leave`, `where`). Environment variables: `MOM_AGENT` (identity; Claude Code sessions are detected automatically), `MOM_HOME` (default `~/.mom`), `MOM_MODE`, `MOM_IDLE_SEC` (default 90), `MOM_TTL_SEC` (default 900), `MOM_DISABLE=1`.
 
 ## Works with
 
-- **Claude Code**: full enforcement via plugin hooks (`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`, `SubagentStop`, `SessionEnd`). Parallel subagents inside one session are tracked as separate agents.
-- **Codex**: `mom init-codex` installs native patch, shell and lifecycle hooks. Review/trust with `/hooks`. See [setup and limits](docs/other-agents.md).
-- **Cursor, Aider, humans**: cooperative, through the same CLI; claims taken from any tool are honoured by the Claude Code hooks. See [docs/other-agents.md](docs/other-agents.md).
-
-## Design principles
-
-- **Deterministic over clever.** Overlap detection is a string comparison; the participating agents, not a referee model, decide who yields.
-- **Zero cost when alone, near-zero when nobody collides.** No agents present → hooks print nothing. Others present → two lines once, then silence until a collision.
-- **Block the destructive, warn on the rest.** v0.1 blocked every overlapping edit and was slower for no gain; v0.4 tried blocking commits on files under edit and agents waited out their timeouts and gave up. Both are now advisory.
-- **The board is derived, not edited.** A shared STATUS.md would be its own race. `mom status` renders from the claim files.
-- **Plain files you can `cat`.** `mom where` shows the directory. Delete it to reset.
-
-More in [docs/design.md](docs/design.md).
+- **Claude Code**: full enforcement through plugin hooks. Parallel subagents in one session count as separate agents.
+- **Codex**: `mom init-codex` installs native hooks. `apply_patch` edits are claimed like Claude Code edits, and shell commands are screened. A Sonnet + Codex run scored 100% with and without mom (n = 5 / 4). The 8-agent mixed run is still unmeasured because the Codex plan's usage limit ran out.
+- **Cursor, Aider, humans**: cooperative, through the CLI (`mom begin`, `mom release`). The Claude Code hooks honor claims taken from any tool. See [docs/other-agents.md](docs/other-agents.md).
 
 ## FAQ
 
-**Why not git worktrees?** Use them when tasks are independent. mom is for when they are not (two features touching the same modules), or when you don't want to plan ahead. Worktrees each get their own mom state, so the two compose.
+**Why not git worktrees?** Use them when tasks are independent. mom is for when they aren't (two features touching the same files), or when you don't want to plan ahead. Each worktree gets its own mom state, so the two work together.
 
-**Does it touch my repo?** No. State is keyed by the checkout's path under `~/.mom/`. `mom init` is the opt-in alternative that puts `.mom/` (git-ignored) in the repo so non-Claude tools can share it.
+**Does it slow Claude Code down?** Each hooked tool call starts one Node process, about 40 ms. Token and turn costs are in the table above.
 
-**What if an agent needs a file someone else holds for a long time?** `mom wait <file>` blocks up to 3 minutes by default and returns early with instructions if it detects a circular wait. `mom claim --steal <file>` exists for when the holder is clearly gone but its process is still alive.
-
-**Does this slow Claude Code down?** One Node process start (~40 ms) per hooked tool call. In the benchmark's common case, coordinated agents used the same number of turns as uncoordinated ones.
-
-**Does it work on Windows?** Claims and hooks are plain Node; liveness falls back to heartbeats where `kill -0` isn't meaningful. Untested so far; issues welcome.
+**Windows?** It's plain Node. Where `kill -0` isn't meaningful, it checks heartbeats instead to tell whether an agent is still alive. It hasn't been tested on Windows yet.
 
 ## License
 

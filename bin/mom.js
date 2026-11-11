@@ -106,9 +106,6 @@ class State {
    *  operations are blocked (whole-file Write / shell rewrite of a held file, tree-wide git ops).
    *  'strict': any edit to a file another agent holds is blocked. */
   get mode() { return process.env.MOM_MODE || this.cfg.mode || 'advisory'; }
-  /** Opt-in (`mom init --brief full`, MOM_BRIEF=full): teach the whole protocol up front and show status with every prompt.
-   *  About 2x the turns; for weaker models that rewrite whole files. Default: silent unless agents share a file. */
-  get fullBrief() { return (process.env.MOM_BRIEF || this.cfg.brief) === 'full'; }
   /** Enabled in any git checkout (or anywhere with a .mom/) unless MOM_DISABLE is set. */
   get enabled() { return !!this.dir && !process.env.MOM_DISABLE; }
   ensure() {
@@ -382,19 +379,15 @@ function renderInbox(st, me) {
   const { events, end } = st.readLog(from);
   if (meRec && end !== from) { meRec.cursor = end; st.saveAgent(meRec); }
   const present = st.gc();
-  const full = st.fullBrief;
   const sharesFile = id => Object.keys((present[id] && present[id].edited) || {}).some(f => mine[f]);
   const lines = [];
   for (const e of events) {
     if (e.agent === me) continue;
     const who = present[e.agent] ? label(present[e.agent], me) : `[${short(e.agent)}]`;
-    if (full && e.type === 'join') lines.push(`${who} started working in this repo.`);
-    else if (full && e.type === 'leave') lines.push(`${who} finished and left.`);
-    else if (full && e.type === 'plan') lines.push(`${who} plan: "${e.text}"${e.files && e.files.length ? ` (files: ${e.files.join(' ')})` : ''}`);
-    else if (e.type === 'note') {
-      if (full || sharesFile(e.agent)) lines.push(`${who} note: ${e.text}`);
+    if (e.type === 'note') {
+      if (sharesFile(e.agent)) lines.push(`${who} note: ${e.text}`);
     } else if (e.type === 'handoff') {
-      const files = (e.modified || []).filter(f => full || mine[f]);
+      const files = (e.modified || []).filter(f => mine[f]);
       if (files.length) lines.push(`${who} released edited file${files.length === 1 ? '' : 's'}: ${files.join(' ')} — re-read before editing (your earlier read is stale).`);
     } else if (e.type === 'overlap' && e.holder === me) {
       const held = st.getClaim(e.path);
@@ -406,17 +399,6 @@ function renderInbox(st, me) {
 
 const COLLIDE_TIP = cmd => `If you change an interface other code calls (signature, field, flag, export), tell the others: \`${cmd} note "<what changed>"\`. \`${cmd} status\` shows who holds what.`;
 
-const BRIEF = (others, cmd, mode) => [
-  `mom is active: ${others} other agent${others === 1 ? ' is' : 's are'} working in this repo right now.`,
-  mode === 'strict'
-    ? 'Hooks enforce file ownership: a file you Edit/Write is claimed for you automatically; editing a file another agent holds is blocked (you will be told who has it). Edit files with the Edit/Write tools, not shell scripts, so ownership is tracked.'
-    : 'Hooks track who is editing what. Use the Edit tool for changes (surgical edits to a file someone else is editing are allowed; you will be warned so you keep them small and re-read first). Rewriting a whole file that another agent is editing (Write tool, `cat >`, scripts) is blocked.',
-  `Protocol (cheap, do it): 1) Before your first edit run \`${cmd} plan "<one-line goal>" <files you expect to touch>\`.`,
-  `2) If you change a shared interface (signature, schema, CLI flag, export), run \`${cmd} note "<what changed>"\`.`,
-  `3) If blocked: work on your other files first, or \`${cmd} wait <file>\` (blocks until free), then re-read the file before editing. When you are done with a file others may need, \`${cmd} release <file>\` early.`,
-  `4) Coordinate one committer and review the whole staged diff: \`${cmd} mine --json\` lists files, not hunk ownership. Never \`git add -A\`/\`commit -a\`, stash, reset, or checkout/restore the whole tree: other agents have uncommitted work here. \`${cmd} status\` shows who holds what.`,
-].join('\n');
-
 // ---------------------------------------------------------------- commands
 function parseArgs(argv) {
   const flags = {}, pos = [];
@@ -426,7 +408,7 @@ function parseArgs(argv) {
     if (a.startsWith('--')) {
       const [k, v] = a.slice(2).split('=');
       if (v !== undefined) flags[k] = v;
-      else if (i + 1 < argv.length && !argv[i + 1].startsWith('-') && ['as', 'timeout', 'command', 'settings', 'root', 'n', 'mode', 'brief'].includes(k)) flags[k] = argv[++i];
+      else if (i + 1 < argv.length && !argv[i + 1].startsWith('-') && ['as', 'timeout', 'command', 'settings', 'root', 'n', 'mode'].includes(k)) flags[k] = argv[++i];
       else flags[k] = true;
     } else pos.push(a);
   }
@@ -533,7 +515,7 @@ const commands = {
       const settingsPath = flags.settings ? path.resolve(flags.settings) : path.join(root, '.claude', 'settings.json');
       const cmd = flags.command || hookCommand();
       const res = installHooks(settingsPath, cmd);
-      writeJSONAtomic(path.join(st.dir, 'config.json'), { ...readJSON(path.join(st.dir, 'config.json'), {}), cmd, mode: flags.mode === 'strict' ? 'strict' : 'advisory', ...(flags.brief === 'full' ? { brief: 'full' } : {}) });
+      writeJSONAtomic(path.join(st.dir, 'config.json'), { ...readJSON(path.join(st.dir, 'config.json'), {}), cmd, mode: flags.mode === 'strict' ? 'strict' : 'advisory' });
       done.push(`${res} hooks in ${path.relative(process.cwd(), settingsPath)} (command: ${cmd} hook <event>)`);
     }
     if (!flags['no-skill']) {
@@ -829,16 +811,11 @@ function runHook(st, event) {
         } catch {}
       } else if (!onPath('mom')) cmd = `node ${fs.realpathSync(__filename)}`;
       if (st.cfg.cmd !== cmd) st.saveCfg({ cmd });
-      if (!st.fullBrief) return; // silent by default: mom only speaks once agents touch the same files
-      const others = st.liveAgents().filter(a => a.id !== me);
-      if (others.length) out(BRIEF(others.length, st.cmd, st.mode) + '\n\n' + renderStatus(st, me));
-      return;
+      return; // silent: mom only speaks once agents touch the same files
     }
     case 'prompt': {
       ensureAgent(st, me); st.renewAll(me);
-      const parts = [renderInbox(st, me)];
-      if (st.fullBrief && st.liveAgents().some(a => a.id !== me)) parts.push(renderStatus(st, me, { compact: true }));
-      out(parts.filter(Boolean).join('\n'));
+      out(renderInbox(st, me));
       return;
     }
     case 'pre-edit': {
@@ -1035,10 +1012,9 @@ Agent protocol:
   mom where                      where this checkout's state lives
 Hooks:  mom hook <session-start|prompt|pre-edit|pre-read|pre-bash|post-tool|stop|session-end>
 Modes:  mom init --mode advisory (default) | strict      (or MOM_MODE=...)
-        mom init --brief full (opt-in: brief the whole protocol up front; MOM_BRIEF=full)
 Env:    MOM_AGENT (identity), MOM_ROOT (repo root), MOM_HOME (state root, default ~/.mom),
         MOM_TTL_SEC (reservation TTL, default 900), MOM_IDLE_SEC (an edited file stops counting as mid-edit after this
-        many seconds without edits by its holder, default 90; claims taken with \`mom begin\` are held until release), MOM_BRIEF=full, MOM_DISABLE=1 (hooks do nothing)
+        many seconds without edits by its holder, default 90; claims taken with \`mom begin\` are held until release), MOM_DISABLE=1 (hooks do nothing)
 `;
 
 // ---------------------------------------------------------------- main

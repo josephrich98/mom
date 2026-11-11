@@ -11,11 +11,23 @@ node bench/report.js bench/results-<tag>.jsonl                 # tail metrics fi
 node bench/rescore.js --tag <tag> [--check <checker>|--no-check] # re-score / re-parse saved trials
 ```
 
-Conditions: `baseline` (no mom) · `mom-advisory` (the default install) · `mom-full` (advisory mode with `--brief full`) · `mom-strict`.
+Conditions: `baseline` (no mom) · `mom-advisory` (the default install) · `mom-strict`. Older results also have `mom-full`, the v0.4 up-front brief (`--brief full`), which was removed after v0.5.1: on Haiku it did no better than the default (0/10 bad runs either way) at up to 2× the turns.
 
 - **Counterbalanced:** trial *k* runs every condition, in an order that rotates with *k*; `--parallel` runs that many at once.
 - **Frozen code:** mom's `bin/` and `skills/` are copied into each trial directory, from `--mom-src` if given, and the row records the hash. Editing the repo during a run cannot change what a trial executes.
 - **Failures kept, not silently dropped:** a trial is marked `valid: false` (and excluded by `report.js`, which counts the exclusions) when an agent's run failed for reasons that aren't the agent's outcome: API credit exhausted, Codex usage limit, harness error, or a mom condition whose hooks never fired. Agent timeouts are valid outcomes and are reported.
+
+## Charts
+
+The README's correctness chart and table, plus tokens, wall-clock and turns across versions, all regenerate from the committed `results-*.jsonl` with `node bench/charts.js`.
+
+![Tokens per run, without and with mom, for each scenario](../assets/charts/tokens.svg)
+
+![Wall-clock per run, without and with mom, for each scenario](../assets/charts/time.svg)
+
+![Turns per run in the common case across mom versions: 36.0 without mom, 55.9 for v0.5 as first committed, 34.5 after the in-place-edit fixes, 34.3 for v0.5.1](../assets/charts/versions.svg)
+
+The versions chart is a warning about mom itself: v0.5 as first committed blocked harmless in-place shell edits and cost 55% more turns. v0.5.1 is back to baseline.
 
 ## Scenarios
 

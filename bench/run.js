@@ -9,8 +9,8 @@
  *                     [--fixture bench/fixture-shop] [--tasks bench/tasks-shop.json --check bench/check-shop.js] --tag shop
  *                     [--codex half|<agent names, comma-separated>] [--codex-model gpt-6-astra] [--mom-src <dir with bin/ skills/>]
  *
- * Conditions: baseline (no mom) | mom-advisory (default mom) |
- *             mom-full (advisory mode, --brief full) | mom-strict (strict mode)
+ * Conditions: baseline (no mom) | mom-advisory (default mom) | mom-strict (strict mode)
+ * (older results also have mom-full: the v0.4 up-front brief, removed in v0.6)
  * --concurrency N caps agents running at once (default: all); --orders '[[1,0],[0,1]]' sets the task order per trial k; --login uses the CLI's own login instead of ANTHROPIC_API_KEY.
  * Trials are counterbalanced: trial k runs every condition, in an order that rotates with k. --parallel runs
  * that many condition-trials at once (each in its own fresh checkout). mom's bin/ and skills/ are snapshotted per
@@ -20,7 +20,7 @@
 const fs = require('fs'), path = require('path'), cp = require('child_process'), os = require('os'), crypto = require('crypto');
 const args = Object.fromEntries(process.argv.slice(2).map((a, i, arr) => a.startsWith('--') ? [a.slice(2), arr[i + 1] && !arr[i + 1].startsWith('--') ? arr[i + 1] : true] : null).filter(Boolean));
 const CONDS = (args.conditions || args.condition || 'baseline').split(',');
-const KNOWN = ['baseline', 'mom-advisory', 'mom-full', 'mom-strict'];
+const KNOWN = ['baseline', 'mom-advisory', 'mom-strict'];
 for (const c of CONDS) if (!KNOWN.includes(c)) throw new Error(`unknown condition ${c}; use ${KNOWN.join('|')}`);
 const TRIALS = +(args.trials || 1);
 const PARALLEL = +(args.parallel || 1);
@@ -71,7 +71,7 @@ function setupWork(trialDir, cond) {
   }
   git(['init', '-q'], work);
   if (isMom(cond)) {
-    cp.execFileSync(process.execPath, [bin, 'init', '--root', work, '--command', `node ${bin}`, '--mode', modeOf(cond), ...(cond === 'mom-full' ? ['--brief', 'full'] : [])], { cwd: work, stdio: 'ignore' });
+    cp.execFileSync(process.execPath, [bin, 'init', '--root', work, '--command', `node ${bin}`, '--mode', modeOf(cond)], { cwd: work, stdio: 'ignore' });
     if (tasks.agents.some(a => cliOf(a) === 'codex')) cp.execFileSync(process.execPath, [bin, 'init-codex'], { cwd: work, stdio: 'ignore' });
   }
   // one fixture commit (with mom's settings/.gitignore when present) so agents start from a clean tree

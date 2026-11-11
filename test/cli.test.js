@@ -392,23 +392,6 @@ test('a first same-file overlap warns and carries the note tip; notes then reach
   assert.match(run(d, ['hook', 'post-tool'], { stdin: hookIn('B', { cwd: d }), env }).out, /note: format\(\) now returns an array/);
 });
 
-test('--brief full is opt-in: protocol at session start, status on prompts, every note and plan delivered', () => {
-  const d = mk();
-  const env = { MOM_BRIEF: 'full', MOM_MODE: 'advisory' };
-  run(d, ['hook', 'session-start'], { stdin: hookIn('A', { cwd: d }), env });
-  let r = run(d, ['hook', 'session-start'], { stdin: hookIn('B', { cwd: d }), env });
-  assert.match(r.out, /Protocol/); assert.match(r.out, /plan "<one-line goal>"/);
-  assert.match(run(d, ['hook', 'prompt'], { stdin: hookIn('B', { cwd: d }), env }).out, /2 agents active/);
-  run(d, ['plan', 'rename Store.add', 'a.js'], { as: 'A', env });
-  run(d, ['note', 'format() now returns an array'], { as: 'A', env });
-  r = run(d, ['hook', 'post-tool'], { stdin: hookIn('B', { cwd: d }), env });
-  assert.match(r.out, /plan: .{0,2}rename Store.add/); assert.match(r.out, /note: format/, 'delivered without a shared file');
-  const init = fs.mkdtempSync(path.join(os.tmpdir(), 'mom-brief-'));
-  cp.execSync('git init -q', { cwd: init });
-  run(init, ['init', '--no-skill', '--brief', 'full']);
-  assert.equal(JSON.parse(fs.readFileSync(path.join(init, '.mom/config.json'))).brief, 'full');
-});
-
 test('stale-write guard: a shell write is blocked only if another agent changed that file after you read it', () => {
   const d = mk();
   const env = { MOM_MODE: 'advisory' };

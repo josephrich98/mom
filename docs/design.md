@@ -15,7 +15,7 @@ No heavy prompting. No supervising LLM. An agent working alone must pay nothing.
 | Failure mode | Mechanism |
 |---|---|
 | Both agents check a file and both see it as free | Check-and-claim is one atomic filesystem op: `open(O_EXCL)` on `.mom/claims/<path>.json`. Claim mutation is serialized by a short-lived state mutex; no daemon. |
-| An agent crashes while holding files | Each agent record stores the host process pid; a claim is dead the moment its owner's process is gone. Reservations also expire by TTL (15 min, renewed by every hook call). Claims with uncommitted edits never expire while the owner lives. Replacement, renewal, release and garbage collection hold the same state mutex so stale snapshots cannot delete a successor claim. A crashed mutex fails closed; see recovery in other-agents.md. |
+| An agent crashes while holding files | Each agent record stores the host process pid; a claim is dead the moment its owner's process is gone. Reservations also expire by TTL (15 min, renewed by every hook call). Claims with edits go cold after 90 s without edits (see Idle claims below); `mom begin` claims are held until release. Replacement, renewal, release and garbage collection hold the same state mutex so stale snapshots cannot delete a successor claim. A crashed mutex fails closed; see recovery in other-agents.md. |
 | The up-front file list is wrong | Every Edit/Write passes through a PreToolUse hook that claims the file on the spot (or blocks). |
 | Two files depend on a changing interface | `mom note "<what changed>"` reaches agents sharing a file with the sender, which receive it as `additionalContext` after their next tool call. |
 | An agent read a file that another agent then changed | Releasing an edited file logs a *handoff*. Everyone else is told "re-read X before editing" exactly once. `mom wait` says the same thing when it acquires a file that was handed off. |
@@ -27,7 +27,7 @@ No heavy prompting. No supervising LLM. An agent working alone must pay nothing.
 
 v0.1 blocked every edit to a file another agent held. Three Sonnet 5.5 agents on overlapping tasks then took 2–3× longer than uncoordinated agents for identical results, and once deadlocked (A waiting for B's test file, B waiting for A's `store.js`; both timed out and re-waited). Uncoordinated agents were fine because they re-read before every surgical edit and Claude Code's `Edit` tool refuses edits against a stale read.
 
-So the default became **advisory**: a surgical `Edit` to a held file is allowed, both agents get a one-line heads-up (once per file), and the holder is told to re-read. What stays blocked is what actually destroys work: whole-file `Write`, shell rewrites (`cat >`, `sed -i`, inline python/node), and tree-wide git operations. `wait` detects wait-for cycles and makes the later agent yield. Strict mode remains for whole-file writers.
+So the default became **advisory**: a surgical `Edit` to a held file is allowed, both agents get a one-line heads-up (once per file), and the holder is told to re-read. What stays blocked is what actually destroys work: whole-file `Write`, shell overwrites (`cat >`, `tee`, `cp`, scripts that write without reading), and tree-wide git operations. `wait` detects wait-for cycles and makes the later agent yield. Strict mode remains for whole-file writers.
 
 ## Silent unless files overlap
 
@@ -43,16 +43,20 @@ mom now says nothing at session start or on prompts. An agent alone, or alongsid
 | it stages a file another agent is mid-edit on | one heads-up |
 | an agent sharing a file posts a `mom note`, or releases a file this agent has touched | one line |
 
-`--brief full` (`MOM_BRIEF=full`) is the opt-in exception: it keeps the v0.4 up-front protocol, status on every prompt, and delivery of every plan, note and handoff. It doubles the turns, but it was the only setting with no bad Haiku runs (0/10, against 4/11 without mom).
+Until v0.6, `--brief full` (`MOM_BRIEF=full`) kept the v0.4 up-front protocol as an opt-in. It doubled the turns and was meant for weaker models, but on 2026-11-10 Haiku had no bad runs without it either (0/10), so it was removed.
+
+## Lost-update repair (v0.6)
+
+In-place edits apply to the file's current text, so they were allowed through. But a script that reads the file and then rewrites a paragraph from text the agent saw minutes earlier is also "in place", and it silently reverts other agents' changes to that paragraph. mom now keeps each file as each agent last read it in full, and the text just before each write. After the write it runs a word-level three-way merge (`bin/merge3.js`): base = the agent's read, theirs = the text before the write, mine = the text after. Changes from others that the write reverted are put back, and the writer is told. Where both sides changed the same words, the writer's version stands.
 
 ## Idle claims
 
-v0.4 held a claim with edits until the holder's turn ended. In a headless run (`claude -p`, `codex exec`), or any long interactive turn, the turn is the whole run. Haiku agents in lean mode then polled `mom status` for each other's files until 4 of them hit the 20-minute benchmark timeout. Now a claim observed through a hook (Edit/Write/patch) stays hot only while its holder keeps editing that file. After `MOM_IDLE_SEC` (default 90) without edits, it stops blocking and stops showing as mid-edit, and the release is logged as a handoff, so the next taker re-reads. Claims taken with `mom begin` (hookless agents, shell edits) carry no edit timestamps and are held until released or until the owner dies. `mom init --brief full` (or `MOM_BRIEF=full`) restores the v0.4 brief; the benchmark compares both.
+v0.4 held a claim with edits until the holder's turn ended. In a headless run (`claude -p`, `codex exec`), or any long interactive turn, the turn is the whole run. Haiku agents in lean mode then polled `mom status` for each other's files until 4 of them hit the 20-minute benchmark timeout. Now a claim observed through a hook (Edit/Write/patch) stays hot only while its holder keeps editing that file. After `MOM_IDLE_SEC` (default 90) without edits, it stops blocking and stops showing as mid-edit, and the release is logged as a handoff, so the next taker re-reads. Claims taken with `mom begin` (hookless agents, shell edits) carry no edit timestamps and are held until released or until the owner dies.
 
 ## What it costs
 
 - Claude alone: SessionStart prints nothing. Codex gets one identity line.
-- With others, no collisions: ~80 tokens once at session start; nothing per prompt.
+- With others, no collisions: nothing.
 - With collisions: one line per relevant event; a 2-line BLOCKED message per blocked operation.
 - Latency: one Node process start (~40 ms) per hooked tool call.
 
@@ -75,7 +79,8 @@ Overlap detection is a string comparison. The participating agents already have 
   (or <repo>/.mom/ after `mom init`:    shared with non-Claude tools, git-ignored)
   agents/<id>.json     plan, pid, host, heartbeat, inbox cursor, files edited this session
   claims/<path>.json   owner, since, expires, modified, edits
-  log.jsonl            join / plan / note / blocked / handoff / leave
+  log.jsonl            join / plan / note / write / blocked / handoff / restored / leave
+  snap/<agent>/        each file as that agent last read it, and just before its current write
   mutation.lock/       short-lived claim mutation mutex
   config.json          cmd (how agents invoke mom here), mode
 ```

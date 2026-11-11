@@ -44,11 +44,6 @@ function hook(bin) {
   // Sent only alongside a collision: a worker with no overlap never hears from mom.
   const identity = `mom: your identity is ${id}; pass \`--as ${id}\` to any mom command (${quote(process.execPath)} ${quote(bin)} <cmd> --as ${id}). If you edit files with shell commands, first run \`begin --as ${id} <files>\` (exit 3 = another worker holds it: do other work first).`;
 
-  let cfgBrief; try { cfgBrief = JSON.parse(fs.readFileSync(path.join(input.cwd || '.', '.mom', 'config.json'), 'utf8')).brief; } catch {}
-  const full = (process.env.MOM_BRIEF || cfgBrief) === 'full';
-  if (full && (event === 'SessionStart' || event === 'UserPromptSubmit')) outputs.push(
-    `mom coordination: your identity is ${id}. For shell edits run ${quote(process.execPath)} ${quote(bin)} begin --as ${id} <files> before reading/editing; exit 3 means held, so do other work or wait and re-read. Use the same --as identity for plan, note, inbox, mine and release. Release files promptly after a coherent change. Before tests, check mom status. File lists do not isolate other agents' hunks or the shared Git index; coordinate commits.`);
-
   const accept = r => {
     if (r.error || r.status !== 0) {
       process.stderr.write(`${r.stderr || r.error || 'mom hook failed'}\n${identity}\n`);
